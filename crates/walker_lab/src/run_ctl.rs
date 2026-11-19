@@ -81,7 +81,7 @@ pub const RUN_BOUNDS: [(f32, f32, f32); 18] = [
     (0.3, 3.0, 0.1),    // kp
     (0.03, 0.4, 0.015), // kd
     (0.2, 2.5, 0.1),    // leg_k
-    (-0.2, 0.8, 0.05),  // toe_push
+    (0.0, 0.9, 0.05),   // toe_push (toe-down angle at push-off)
     (0.0, 2.0, 0.1),    // arm_k
     (0.0, 2.0, 0.1),    // wheel_k
     (0.3, 1.4, 0.05),   // couple
@@ -268,12 +268,15 @@ impl RunController {
                 let len = if pushing { g.l_push } else { g.l_comp } * lmax;
                 let (qk, qm, _) = leg_ik(&spec, len, g.couple);
                 let foot_yaw = yaw_of(w.bodies[leg.bodies[B_FOOT]].rotation());
+                // Toe push-off only once the centre of mass is ahead of the stance foot (late stance);
+                // pushing earlier drives the body backwards.
+                let com_ahead = (inv_h * (com - w.bodies[leg.bodies[B_FOOT]].translation())).z > 0.05;
                 act.set(i, S_YAW, wrap(foot_yaw - cmd.heading).clamp(-0.35, 0.35), gains.kp);
                 act.set(i, S_ROLL, th_r, stiff.kp);
                 act.set(i, S_PITCH, th_p - lean_des, stiff.kp);
                 act.set(i, S_KNEE, qk, spring.kp);
                 act.set(i, S_META, qm, spring.kp);
-                act.set(i, S_FPITCH, -fp_p - if pushing { g.toe_push } else { 0.0 }, gains.kp);
+                act.set(i, S_FPITCH, -fp_p + if pushing && com_ahead { g.toe_push } else { 0.0 }, gains.kp);
                 act.set(i, S_FROLL, -fp_r, gains.kp);
             } else {
                 let (len_frac, pitch) = match mode {
