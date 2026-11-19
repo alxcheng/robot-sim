@@ -247,10 +247,12 @@ fn run_score(build: &str, g: run_ctl::RunGait, assist: f32) -> (f32, Vec<Metrics
                 s -= 30.0 * m.heading_err_end;
             }
             if build == "E" || build == "F" {
-                // Style: real push-off, deer-like high foot lift, upright torso.
-                s += 40.0 * (m.pushoff_deg / 20.0).clamp(0.0, 1.0);
-                s += 40.0 * (m.swing_clearance_m / 0.30).clamp(0.0, 1.0);
+                // Style: real push-off, deer-like high foot lift, upright torso. Only counts when the run
+                // actually tracks the command, so the tuner can't trade speed for style.
+                let on_task = (1.0 - m.speed_err / 0.5).clamp(0.0, 1.0) * (1.0 - m.heading_err_end / 0.5).clamp(0.0, 1.0);
+                s += on_task * (40.0 * (m.pushoff_deg / 20.0).clamp(0.0, 1.0) + 40.0 * (m.swing_clearance_m / 0.30).clamp(0.0, 1.0));
                 s -= 2.0 * (m.mean_tilt_deg - 10.0).max(0.0);
+                s -= 40.0 * m.speed_err + 20.0 * m.heading_err_end;
             }
         }
         if m.non_finite {
