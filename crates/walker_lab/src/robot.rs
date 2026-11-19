@@ -105,7 +105,7 @@ impl RobotSpec {
         match self.frame {
             Frame::Classic => (HIP_X, HIP_Y, TRUNK_Y),
             Frame::Mech => (0.34, 2.05, 2.70),
-            Frame::MechV => (0.30, 2.05, 2.15),
+            Frame::MechV => (0.42, 2.05, 2.10),
         }
     }
     /// Segment lengths from hip to the foot gimbal (virtual leg), and gimbal height above the ground.
@@ -114,7 +114,7 @@ impl RobotSpec {
             return ([0.52, 0.74, 0.67], 0.12);
         }
         if self.frame == Frame::MechV {
-            return ([0.50, 0.74, 0.65], 0.16);
+            return ([0.60, 0.66, 0.55], 0.24);
         }
         match self.legs {
             LegKind::Biped => ([0.9, 0.88, 0.0], 0.22),
@@ -149,6 +149,12 @@ pub struct ShapeInfo {
 pub fn shape_style(tag: &str) -> (&'static str, [f32; 2]) {
     match tag {
         "ball" => ("ball", [1.0, 1.0]),
+        // Hinge knuckles: cylinders; half = [radius, half_length, radius], axis by suffix.
+        "hinge_x" => ("cyl_x", [1.0, 1.0]),
+        "hinge_y" => ("cyl_y", [1.0, 1.0]),
+        // Pyramid: base rectangle ±half[0] × ±half[1] at local z = 0, apex at z = half[2].
+        "pyramid" => ("pyramid", [1.0, 1.0]),
+        "v_groin" => ("box", [1.0, 0.6]),
         "v_chest" => ("box", [1.0, 0.55]),
         "v_pelvis" => ("box", [1.0, 0.75]),
         "v_thigh" => ("box", [0.8, 1.15]),
@@ -231,6 +237,14 @@ pub(crate) fn add_body(
         let (kind, taper) = shape_style(p.tag);
         let base = if kind == "ball" {
             ColliderBuilder::ball(p.half[0])
+        } else if kind == "cyl_y" {
+            ColliderBuilder::cylinder(p.half[1], p.half[0])
+        } else if kind == "cyl_x" {
+            ColliderBuilder::cylinder(p.half[1], p.half[0]).rotation(Vector::new(0.0, 0.0, std::f32::consts::FRAC_PI_2))
+        } else if kind == "pyramid" {
+            let [hx, hy, hz] = p.half;
+            let pts = [Vector::new(hx, hy, 0.0), Vector::new(-hx, hy, 0.0), Vector::new(hx, -hy, 0.0), Vector::new(-hx, -hy, 0.0), Vector::new(0.0, 0.0, hz)];
+            ColliderBuilder::convex_hull(&pts).expect("pyramid hull")
         } else if taper != [1.0, 1.0] {
             let [hx, hy, hz] = p.half;
             let mut pts = Vec::new();

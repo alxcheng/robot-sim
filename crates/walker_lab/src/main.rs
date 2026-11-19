@@ -628,8 +628,29 @@ fn pose(build: &str, out: &str, twist: f32) {
         }
         w.step();
     }
+    // Clipping check: every pair of colliders on different bodies must not intersect.
+    let names: std::collections::HashMap<_, _> = r.links.iter().map(|l| (l.body, l.name.clone())).collect();
+    let cols: Vec<_> = w.colliders.iter().filter_map(|(h, c)| c.parent().map(|b| (h, b))).collect();
+    let mut overlaps = Vec::new();
+    for i in 0..cols.len() {
+        for j in i + 1..cols.len() {
+            if cols[i].1 == cols[j].1 {
+                continue;
+            }
+            // Inner axes of a ball joint live inside the ball by design.
+            let internal = |b| names[&b].ends_with("_hip_roll") || names[&b].ends_with("_shoulder_pitch");
+            if internal(cols[i].1) || internal(cols[j].1) {
+                continue;
+            }
+            let (a, b) = (&w.colliders[cols[i].0], &w.colliders[cols[j].0]);
+            if rapier3d::parry::query::intersection_test(a.position(), a.shape(), b.position(), b.shape()).map(|r| r.intersecting).unwrap_or(false) {
+                overlaps.push(format!("{} × {}", names[&cols[i].1], names[&cols[j].1]));
+            }
+        }
+    }
+    println!("{build}: clipping check — {} overlapping part pairs{}", overlaps.len(), if overlaps.is_empty() { String::new() } else { format!(": {}", overlaps.join(", ")) });
     // Shift so the lowest foot touches y = 0.
-    let min_y = r.legs.iter().map(|l| w.bodies[l.bodies[robot::B_FOOT]].translation().y - 0.08).fold(f32::MAX, f32::min);
+    let min_y = r.legs.iter().map(|l| w.bodies[l.bodies[robot::B_FOOT]].translation().y - 0.07).fold(f32::MAX, f32::min);
     let b: Vec<[f32; 7]> = r.links.iter().map(|l| {
         let body = &w.bodies[l.body];
         let (p, q) = (body.translation(), body.rotation());
