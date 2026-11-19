@@ -541,24 +541,90 @@ fn eval_distill(build: &str, assist: f32) {
     }
 }
 
+/// Fixed-speed test: hold each commanded speed for 12 s (after a short ramp) with the student policy.
+fn eval_speeds(build: &str, assist: f32, gait: run_ctl::RunGait, net: std::sync::Arc<policy::Mlp>) -> Vec<serde_json::Value> {
+    let speeds = [3.0f32, 4.0, 5.0, 6.0, 7.0];
+    std::thread::scope(|s| {
+        let hs: Vec<_> = speeds
+            .iter()
+            .map(|&v| {
+                let net = net.clone();
+                s.spawn(move || {
+                    let mut sc = scenario("run_mid", assist);
+                    sc.spec = build_spec(build);
+                    sc.duration = 12.0;
+                    sc.commands = vec![cmd(0.0, 1.5, 0.0), cmd(1.0, 0.5 * (1.5 + v), 0.0), cmd(2.5, v, 0.0)];
+                    let (m, _) = run_with(&sc, &move || {
+                        Box::new(policy::StudentController { net: net.clone(), tracker: Default::default(), gait, assist, steps: 0 }) as Box<dyn controller::Ctl>
+                    });
+                    serde_json::json!({"cmd": v, "fell": m.falls > 0, "survived_s": m.sim_seconds, "mean_speed": m.mean_speed,
+                        "step_m": m.step_len_m, "cadence_hz": m.cadence_hz, "pushoff_deg": m.pushoff_deg, "airborne": m.flight_fraction})
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
 fn ppo_train(build: &str, iters: usize, init: &str) {
+    ppo_train_mode(build, iters, init, false)
+}
+
+fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool) {
     let assist = 0.0;
     let gait = load_run_gait(build, assist);
     let spec = build_spec(build);
-    let dir = format!("out/ppo_{build}");
+    let dir = if speed_mode { format!("out/ppospeed_{build}") } else { format!("out/ppo_{build}") };
     fs::create_dir_all(&dir).ok();
-    let net: policy::Mlp = serde_json::from_str(&fs::read_to_string(init).expect("init net")).unwrap();
-    let mut pol = ppo::GaussPolicy { log_std: vec![(0.08f32).ln(); run_ctl::ACTION_DIM], net };
+    let txt = fs::read_to_string(init).expect("init net");
+    // Accept either a saved PPO policy (net + log-std) or a distilled network.
+    let mut pol = match serde_json::from_str::<ppo::GaussPolicy>(&txt) {
+        Ok(p) => p,
+        Err(_) => {
+            let net: policy::Mlp = serde_json::from_str(&txt).unwrap();
+            ppo::GaussPolicy { log_std: vec![(0.08f32).ln(); run_ctl::ACTION_DIM], net }
+        }
+    };
     let mut value = policy::Mlp::new(&[policy::OBS_DIM, 128, 128, 1], 99);
     value.in_mean = pol.net.in_mean.clone();
     value.in_std = pol.net.in_std.clone();
     let mut popt = pol.net.adam();
     let mut vopt = value.adam();
     let mut lsopt = (vec![0.0; run_ctl::ACTION_DIM], vec![0.0; run_ctl::ACTION_DIM], 0);
-    let cfg = ppo::RewardCfg { stride_target: 1.8 };
+    let mut cfg = ppo::RewardCfg { stride_target: 1.8, vmax: 3.1, speed_mode };
+    if speed_mode {
+        cfg.vmax = 3.0;
+    }
+    let (mut streak, mut vmax_log) = (0usize, vec![(0usize, cfg.vmax)]);
     let mut log = Vec::new();
     let checkpoint = |it: usize, pol: &ppo::GaussPolicy, log: &mut Vec<serde_json::Value>, extra: serde_json::Value| {
         let arc = std::sync::Arc::new(pol.net.clone());
+        if speed_mode {
+            let sp = eval_speeds(build, assist, gait, arc.clone());
+            let line: Vec<String> = sp.iter().map(|e| format!("{}→{:.1}{} step {:.2}m@{:.1}Hz push {:.0}°",
+                e["cmd"], e["mean_speed"].as_f64().unwrap(), if e["fell"].as_bool().unwrap() { "✗" } else { "" },
+                e["step_m"].as_f64().unwrap(), e["cadence_hz"].as_f64().unwrap(), e["pushoff_deg"].as_f64().unwrap())).collect();
+            println!("  speeds {it}: {}", line.join(" | "));
+            // Clip at the top trained speed.
+            let vtop = extra["vmax"].as_f64().unwrap_or(3.0) as f32;
+            let mut sc = scenario("run_mid", assist);
+            sc.spec = build_spec(build);
+            sc.duration = 12.0;
+            sc.name = format!("SPEED RL · iteration {it} · top cmd {vtop:.1} m/s");
+            sc.commands = vec![cmd(0.0, 1.5, 0.0), cmd(1.0, 0.5 * (1.5 + vtop), 0.0), cmd(2.5, vtop, 0.0)];
+            sc.record = true;
+            let a2 = arc.clone();
+            let (m, rec) = run_with(&sc, &move || Box::new(policy::StudentController { net: a2.clone(), tracker: Default::default(), gait, assist, steps: 0 }) as Box<dyn controller::Ctl>);
+            if let Some(mut rec) = rec {
+                let end = m.first_fall_t.map(|t| t + 1.5).unwrap_or(12.0);
+                rec.frames.retain(|f| f.t >= (end - 6.0).max(0.0) && f.t <= end);
+                fs::write(format!("{dir}/clip_iter{it:04}.json"), serde_json::to_string(&rec).unwrap()).unwrap();
+            }
+            fs::write(format!("{dir}/policy_iter{it:04}.json"), serde_json::to_string(pol).unwrap()).unwrap();
+            log.push(serde_json::json!({"iter": it, "speeds": sp, "train": extra}));
+            fs::write(format!("{dir}/log.json"), serde_json::to_string_pretty(&*log).unwrap()).unwrap();
+            return;
+        }
         let show = eval_student(build, assist, gait, arc.clone(), &format!("PPO · iteration {it}"), Some((&format!("{dir}/clip_iter{it:03}.json"), 6.0)));
         let ev = eval_set(build, assist, &move || {
             Box::new(policy::StudentController { net: arc.clone(), tracker: Default::default(), gait, assist, steps: 0 }) as Box<dyn controller::Ctl>
@@ -580,7 +646,7 @@ fn ppo_train(build: &str, iters: usize, init: &str) {
             let hs: Vec<_> = (0..4).map(|k| s.spawn(move || ppo::rollout(p, v, spec, gait, 6000, (it * 17 + k) as u64 * 1_000_003, cfg))).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        let mut b = ppo::Batch { obs: vec![], act: vec![], logp: vec![], adv: vec![], ret: vec![], ep_returns: vec![], ep_lengths: vec![] };
+        let mut b = ppo::Batch { obs: vec![], act: vec![], logp: vec![], adv: vec![], ret: vec![], ep_returns: vec![], ep_lengths: vec![], ep_track: vec![], ep_cmd: vec![] };
         for x in batches {
             b.obs.extend(x.obs);
             b.act.extend(x.act);
@@ -589,6 +655,8 @@ fn ppo_train(build: &str, iters: usize, init: &str) {
             b.ret.extend(x.ret);
             b.ep_returns.extend(x.ep_returns);
             b.ep_lengths.extend(x.ep_lengths);
+            b.ep_track.extend(x.ep_track);
+            b.ep_cmd.extend(x.ep_cmd);
         }
         let roll_s = t0.elapsed().as_secs_f32();
         let lr_pi = if it <= warmup { 0.0 } else { 1e-5 };
@@ -597,10 +665,25 @@ fn ppo_train(build: &str, iters: usize, init: &str) {
         let ret = b.ep_returns.iter().sum::<f32>() / ne;
         let len = b.ep_lengths.iter().sum::<f32>() / ne;
         let std_mean = pol.log_std.iter().map(|l| l.exp()).sum::<f32>() / pol.log_std.len() as f32;
-        println!("iter {it:3}: ep_return {ret:7.1} ep_len {len:4.1}s eps {:3} | kl {:.4} clip {:.2} vloss {:.3} std {:.3} | {:.0}s rollout {:.0}s total",
-            b.ep_returns.len(), st.kl, st.clip_frac, st.v_loss, std_mean, roll_s, t0.elapsed().as_secs_f32());
-        if it % 25 == 0 {
-            checkpoint(it, &pol, &mut log, serde_json::json!({"ep_return": ret, "ep_len": len, "kl": st.kl}));
+        // Speed curriculum: raise the top commanded speed after 5 consecutive good iterations
+        // (≥85% of episodes survive the full 10 s and episodes near the top speed track it well).
+        let survive = b.ep_lengths.iter().filter(|l| **l >= 9.9).count() as f32 / ne;
+        let top: Vec<f32> = b.ep_track.iter().zip(&b.ep_cmd).filter(|(_, c)| **c >= cfg.vmax - 1.0).map(|(t, _)| *t).collect();
+        let top_track = if top.is_empty() { 0.0 } else { top.iter().sum::<f32>() / top.len() as f32 };
+        if speed_mode && it > warmup {
+            if survive >= 0.85 && top_track >= 0.55 { streak += 1 } else { streak = 0 }
+            if streak >= 5 && cfg.vmax < 7.5 {
+                cfg.vmax = (cfg.vmax + 0.5).min(7.5);
+                streak = 0;
+                vmax_log.push((it, cfg.vmax));
+                println!("  >>> top speed raised to {:.1} m/s at iteration {it}", cfg.vmax);
+            }
+        }
+        println!("iter {it:4}: ep_return {ret:7.1} ep_len {len:4.1}s eps {:3} surv {:.2} top_track {:.2} vmax {:.1} | kl {:.4} clip {:.2} vloss {:.3} std {:.3} | {:.0}s",
+            b.ep_returns.len(), survive, top_track, cfg.vmax, st.kl, st.clip_frac, st.v_loss, std_mean, t0.elapsed().as_secs_f32());
+        let ck_every = if speed_mode { 50 } else { 25 };
+        if it % ck_every == 0 {
+            checkpoint(it, &pol, &mut log, serde_json::json!({"ep_return": ret, "ep_len": len, "kl": st.kl, "vmax": cfg.vmax, "vmax_history": vmax_log}));
         }
     }
 }
@@ -703,6 +786,7 @@ fn main() {
         Some("runreport") => run_report(),
         Some("evaldistill") => eval_distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
         Some("pose") => pose(&a(2).unwrap(), &a(3).unwrap(), a(4).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
+        Some("ppospeed") => ppo_train_mode(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(1000), &a(4).unwrap(), true),
         Some("ppo") => ppo_train(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(100), &a(4).unwrap()),
         Some("distill") => distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0), a(4).map(|s| s.parse().unwrap()).unwrap_or(5)),
         Some("runtune") => run_tune(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(100), a(4).map(|s| s.parse().unwrap()).unwrap_or(0.35)),

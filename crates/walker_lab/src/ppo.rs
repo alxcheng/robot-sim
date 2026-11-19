@@ -40,6 +40,10 @@ impl Rng {
 #[derive(Clone, Copy)]
 pub struct RewardCfg {
     pub stride_target: f32,
+    /// Speed curriculum: commands are sampled up to this speed (m/s).
+    pub vmax: f32,
+    /// Speed mode: tracking tolerance and stride target scale with commanded speed.
+    pub speed_mode: bool,
 }
 
 pub struct Env {
@@ -50,13 +54,16 @@ pub struct Env {
     tracker: ContactTracker,
     gait: RunGait,
     prev_a: Vec<f32>,
+    pub track_sum: f32,
+    pub track_n: f32,
+    pub cmd_sum: f32,
     last_td: Option<[f32; 2]>,
     foot_prev: [bool; 2],
     toe_peak: [f32; 2],
     pub ep_return: f32,
 }
 
-fn random_scenario(spec: RobotSpec, rng: &mut Rng, dur: f32) -> Scenario {
+fn random_scenario(spec: RobotSpec, rng: &mut Rng, dur: f32, vmax: f32) -> Scenario {
     let mut sc = scenario("run_mid", 0.0);
     sc.spec = spec;
     sc.duration = dur;
@@ -64,7 +71,9 @@ fn random_scenario(spec: RobotSpec, rng: &mut Rng, dur: f32) -> Scenario {
     let (mut t, mut heading) = (0.0, 0.0);
     while t < dur {
         heading += (rng.f() - 0.5) * 0.6;
-        sc.commands.push(cmd(t, 1.5 + rng.f() * 1.6, heading));
+        // Half the time near the current top speed, half anywhere from 1.5 m/s up.
+        let v = if rng.f() < 0.5 { vmax - 0.75 * rng.f() } else { 1.5 + (vmax - 1.5) * rng.f() };
+        sc.commands.push(cmd(t, v.max(1.0), heading));
         if rng.f() < 0.3 {
             let a = rng.f() * std::f32::consts::TAU;
             sc.pushes.push(Push { t: t + 2.0, dv_fwd: 0.12 * a.cos(), dv_left: 0.12 * a.sin() });
@@ -75,13 +84,13 @@ fn random_scenario(spec: RobotSpec, rng: &mut Rng, dur: f32) -> Scenario {
 }
 
 impl Env {
-    pub fn new(spec: RobotSpec, gait: RunGait, seed: u64) -> Self {
+    pub fn new(spec: RobotSpec, gait: RunGait, seed: u64, vmax: f32) -> Self {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-        let sc = random_scenario(spec, &mut rng, 10.0);
+        let sc = random_scenario(spec, &mut rng, 10.0, vmax);
         let (w, r) = build_world(&sc);
         Env {
             w, r, sc, t: 0.0, tracker: Default::default(), gait, prev_a: vec![0.0; ACTION_DIM],
-            last_td: None, foot_prev: [true; 2], toe_peak: [0.0; 2], ep_return: 0.0,
+            last_td: None, foot_prev: [true; 2], toe_peak: [0.0; 2], ep_return: 0.0, track_sum: 0.0, track_n: 0.0, cmd_sum: 0.0,
         }
     }
 
@@ -124,10 +133,18 @@ impl Env {
         let tilt_deg = tel.trunk_tilt.to_degrees();
         let smooth: f32 = a_norm.iter().zip(&self.prev_a).map(|(a, b)| (a - b) * (a - b)).sum();
         self.prev_a = a_norm.to_vec();
-        let mut rew = 0.5 + 1.0 * (-v_err * v_err / 0.3).exp() + 0.3 * (-head_err * head_err / 0.05).exp()
+        // Speed tolerance grows with commanded speed in speed mode.
+        let tol = if cfg.speed_mode { 0.3 * (cmdv.speed / 2.5).max(1.0).powi(2) } else { 0.3 };
+        let track = (-v_err * v_err / tol).exp();
+        self.track_sum += track;
+        self.track_n += 1.0;
+        self.cmd_sum += cmdv.speed;
+        let mut rew = 0.5 + 1.0 * track + 0.3 * (-head_err * head_err / 0.05).exp()
             - 0.03 * (tilt_deg - 10.0).max(0.0)
             - 0.002 * smooth;
-        let speed_gate = (-v_err * v_err / 0.5).exp();
+        let speed_gate = (-v_err * v_err / (tol * 1.6)).exp();
+        let stride_target = if cfg.speed_mode { (cmdv.speed / 2.2).max(0.6) } else { cfg.stride_target };
+        let push_w = if cfg.speed_mode { 2.0 } else { 1.0 };
         for k in 0..2 {
             let fb = &self.w.bodies[self.r.legs[k].bodies[B_FOOT]];
             let f = *fb.rotation() * Vector::Z;
@@ -140,13 +157,13 @@ impl Env {
                 let p = [tel.com[0], tel.com[2]];
                 if let Some(q) = self.last_td {
                     let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
-                    rew += 3.0 * (d / cfg.stride_target).clamp(0.0, 1.2) * speed_gate;
+                    rew += 3.0 * (d / stride_target).clamp(0.0, 1.2) * speed_gate;
                 }
                 self.last_td = Some(p);
             }
             if !c[k] && self.foot_prev[k] {
                 // Lift-off: push-off reward.
-                rew += 1.0 * (self.toe_peak[k] / 20.0).clamp(0.0, 1.0) * speed_gate;
+                rew += push_w * (self.toe_peak[k] / 20.0).clamp(0.0, 1.0) * speed_gate;
                 self.toe_peak[k] = 0.0;
             }
             self.foot_prev[k] = c[k];
@@ -164,6 +181,9 @@ pub struct Batch {
     pub ret: Vec<f32>,
     pub ep_returns: Vec<f32>,
     pub ep_lengths: Vec<f32>,
+    /// Per episode: mean speed-tracking score (0..1) and mean commanded speed.
+    pub ep_track: Vec<f32>,
+    pub ep_cmd: Vec<f32>,
 }
 
 pub fn logp(mu: &[f32], log_std: &[f32], a: &[f32]) -> f32 {
@@ -179,10 +199,10 @@ pub fn logp(mu: &[f32], log_std: &[f32], a: &[f32]) -> f32 {
 pub fn rollout(pol: &GaussPolicy, value: &Mlp, spec: RobotSpec, gait: RunGait, steps: usize, seed: u64, cfg: RewardCfg) -> Batch {
     let (gamma, lam) = (0.99f32, 0.95f32);
     let mut rng = Rng(seed | 1);
-    let mut env = Env::new(spec, gait, seed);
+    let mut env = Env::new(spec, gait, seed, cfg.vmax);
     let mut episode = 0u64;
     let (mut obs, mut act, mut lp, mut rews, mut vals, mut dones, mut boots) = (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
-    let (mut ep_returns, mut ep_lengths) = (vec![], vec![]);
+    let (mut ep_returns, mut ep_lengths, mut ep_track, mut ep_cmd) = (vec![], vec![], vec![], vec![]);
     for _ in 0..steps {
         let o = env.obs();
         let mu = pol.net.forward_norm(&o);
@@ -201,8 +221,10 @@ pub fn rollout(pol: &GaussPolicy, value: &Mlp, spec: RobotSpec, gait: RunGait, s
         if end {
             ep_returns.push(env.ep_return);
             ep_lengths.push(env.t);
+            ep_track.push(env.track_sum / env.track_n.max(1.0));
+            ep_cmd.push(env.cmd_sum / env.track_n.max(1.0));
             episode += 1;
-            env = Env::new(spec, gait, seed.wrapping_add(episode * 7919));
+            env = Env::new(spec, gait, seed.wrapping_add(episode * 7919), cfg.vmax);
         }
     }
     // Last state bootstrap for an unfinished episode.
@@ -217,7 +239,7 @@ pub fn rollout(pol: &GaussPolicy, value: &Mlp, spec: RobotSpec, gait: RunGait, s
         adv[t] = gae;
     }
     let ret: Vec<f32> = adv.iter().zip(&vals).map(|(a, v)| a + v).collect();
-    Batch { obs, act, logp: lp, adv, ret, ep_returns, ep_lengths }
+    Batch { obs, act, logp: lp, adv, ret, ep_returns, ep_lengths, ep_track, ep_cmd }
 }
 
 pub struct UpdateStats {
