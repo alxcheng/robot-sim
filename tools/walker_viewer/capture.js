@@ -18,7 +18,7 @@ const { execFileSync } = require('child_process');
   page.on('pageerror', e => console.error('page error:', e.message));
   await page.goto('file://' + path.join(__dirname, 'viewer.html'));
   await page.addScriptTag({ path: path.join(__dirname, 'node_modules/three/build/three.min.js') });
-  await page.evaluate(([r, w, h]) => { window.REC = r; init(w, h); }, [rec, width, height]);
+  await page.evaluate(([r, w, h, cam]) => { window.REC = r; window.CAM = cam; init(w, h); }, [rec, width, height, process.env.CAM || '']);
 
   const stride = Math.max(1, Math.round(1 / (rec.dt * fps)));
   let n = 0;

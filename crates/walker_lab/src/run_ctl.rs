@@ -294,11 +294,19 @@ impl RunController {
             }
         }
 
-        // Arms counter-swing against the same-side leg.
-        if r.arms.is_some() {
+        // Arms counter-swing against the same-side leg; with elbows, the forearm folds up on the
+        // forward swing (like a runner), and the shoulders sit slightly out from the body.
+        if let Some(arms) = &r.arms {
             for i in 0..2 {
                 let (th_p, _) = ang(r.legs[i].bodies[B_THIGH]);
-                act.arms[i] = (-g.arm_k * (th_p - tr_pitch)).clamp(-1.0, 1.0);
+                let pitch = (-g.arm_k * (th_p - tr_pitch)).clamp(-1.0, 1.0);
+                act.arms[i][0] = pitch;
+                if arms[i].roll.is_some() {
+                    act.arms[i][1] = r.legs[i].side * 0.10;
+                }
+                if arms[i].elbow.is_some() {
+                    act.arms[i][2] = -(0.55 + 0.8 * (-pitch).max(0.0)).min(2.0);
+                }
             }
         }
         (act, stance_leg)
@@ -320,10 +328,11 @@ const SLOT_JOINT: [usize; 7] = [HIP_YAW, HIP_ROLL, HIP_PITCH, KNEE, META, ANKLE_
 pub struct Action {
     pub legs: [[f32; 7]; 2],
     pub kp: [[f32; 7]; 2],
-    pub arms: [f32; 2],
+    /// Per arm: [shoulder pitch, shoulder roll, elbow].
+    pub arms: [[f32; 3]; 2],
 }
 
-pub const ACTION_DIM: usize = 30;
+pub const ACTION_DIM: usize = 34;
 
 impl Action {
     pub fn set(&mut self, leg: usize, slot: usize, target: f32, kp: f32) {
@@ -338,8 +347,11 @@ impl Action {
                 v[14 + l * 7 + k] = self.kp[l][k];
             }
         }
-        v[28] = self.arms[0];
-        v[29] = self.arms[1];
+        for i in 0..2 {
+            for k in 0..3 {
+                v[28 + i * 3 + k] = self.arms[i][k];
+            }
+        }
         v
     }
     pub fn from_slice(v: &[f32]) -> Self {
@@ -350,7 +362,11 @@ impl Action {
                 a.kp[l][k] = v[14 + l * 7 + k].clamp(0.1, 4.0);
             }
         }
-        a.arms = [v[28], v[29]];
+        for i in 0..2 {
+            for k in 0..3 {
+                a.arms[i][k] = v[28 + i * 3 + k];
+            }
+        }
         a
     }
 }
@@ -369,9 +385,16 @@ pub fn apply_action(w: &mut PhysicsWorld, r: &Robot, a: &Action, kd: f32) {
             set_motor(w, jh, SLOT_JOINT[k], a.legs[i][k], &JointGains { kp: a.kp[i][k], kd });
         }
     }
-    if let Some(arms) = r.arms {
-        for (i, (ja, _)) in arms.iter().enumerate() {
-            set_motor(w, *ja, ARM, a.arms[i], &JointGains { kp: 1.0, kd: 0.08 });
+    if let Some(arms) = &r.arms {
+        let g = JointGains { kp: 1.0, kd: 0.08 };
+        for (i, arm) in arms.iter().enumerate() {
+            set_motor(w, arm.pitch.0, ARM, a.arms[i][0], &g);
+            if let Some(jr) = arm.roll {
+                set_motor(w, jr, ARM, a.arms[i][1], &g);
+            }
+            if let Some((je, _)) = arm.elbow {
+                set_motor(w, je, ARM, a.arms[i][2], &JointGains { kp: 0.6, kd: 0.08 });
+            }
         }
     }
 }

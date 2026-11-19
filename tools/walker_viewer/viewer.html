@@ -21,8 +21,8 @@
 let scene, camera, renderer, meshes = [], camPos = null, camTarget = null, arrow = null;
 
 const COLORS = {
-  torso: 0xaab4be, reactor: 0x66727e, head: 0xc4ccd3, arm: 0x8d98a3,
-  thigh: 0x8e99a4, shin: 0x8e99a4, meta: 0x7a8591, foot: 0x4b5560, gimbal: 0x2a323a, wheel: 0x5a6570,
+  torso: 0xaab4be, reactor: 0x66727e, waist: 0x5f6a75, plate: 0xc4ccd3, pauldron: 0xb4bec7, head: 0xc4ccd3, arm: 0x8d98a3,
+  thigh: 0x8e99a4, shin: 0x8e99a4, meta: 0x7a8591, foot: 0x4b5560, hoof: 0x3a4250, forearm: 0x7f8a95, gimbal: 0x2a323a, wheel: 0x5a6570,
 };
 
 function init(width, height) {
@@ -106,7 +106,8 @@ function show(i) {
   });
   const trunk = f.b[0];
   const target = new THREE.Vector3(trunk[0], 1.6, trunk[2]);
-  const desired = target.clone().add(new THREE.Vector3(7.0, 2.4, 5.5));
+  const off = window.CAM === 'front' ? new THREE.Vector3(0.0, 0.5, 9.5) : window.CAM === 'side' ? new THREE.Vector3(9.5, 0.4, 0.0) : new THREE.Vector3(7.0, 2.4, 5.5);
+  const desired = target.clone().add(off);
   if (!camPos) { camPos = desired.clone(); camTarget = target.clone(); }
   camPos.lerp(desired, 0.08); camTarget.lerp(target, 0.12);
   camera.position.copy(camPos); camera.lookAt(camTarget);
@@ -134,6 +135,10 @@ function show(i) {
   if (f.t > 2) { window.frameCount++; if (f.feet === 0) window.flightCount++; }
   const pct = window.frameCount ? Math.round(100 * window.flightCount / window.frameCount) : 0;
   document.getElementById('hud').innerHTML += `<br>airborne ${pct}% of time` + (f.feet === 0 ? ' <b>● AIRBORNE</b>' : '');
+  if (f.toe) {
+    const push = [0, 1].filter(k => f.contact[k] && f.toe[k] > 8).map(k => f.toe[k]);
+    document.getElementById('hud').innerHTML += push.length ? `<br>toe push-off <b>${Math.max(...push).toFixed(0)}°</b>` : '<br>&nbsp;';
+  }
   const lab = document.getElementById('label');
   lab.textContent = f.label; lab.className = f.label === 'FALL' ? 'fall' : '';
   renderer.render(scene, camera);

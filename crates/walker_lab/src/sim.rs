@@ -52,6 +52,11 @@ pub struct Metrics {
     pub flight_phases: u32,
     /// Std-dev of centre-of-mass height (m): bounce.
     pub com_y_std: f32,
+    /// Mean, over stance phases, of the largest toe-down angle of the stance foot (heel lifting = push-off).
+    pub pushoff_deg: f32,
+    /// Mean, over swing phases, of the highest the swinging foot rises.
+    pub swing_clearance_m: f32,
+    pub mean_tilt_deg: f32,
     pub non_finite: bool,
     pub max_tilt_deg: f32,
     pub wall_ms: f64,
@@ -67,6 +72,9 @@ pub struct Frame {
     pub cmd_heading: f32,
     pub label: String,
     pub feet: u8,
+    /// Toe-down angle of each foot (deg) and whether it is on the ground.
+    pub toe: [f32; 2],
+    pub contact: [bool; 2],
 }
 
 #[derive(Serialize)]
@@ -148,6 +156,10 @@ pub fn run_with(sc: &Scenario, mk: &dyn Fn() -> Box<dyn Ctl>) -> (Metrics, Optio
     let mut flight = 0usize;
     let (mut in_air, mut phases, mut air_frames) = (false, 0u32, 0usize);
     let (mut ysum, mut y2sum) = (0.0f64, 0.0f64);
+    // Per-foot phase trackers for push-off and swing clearance.
+    let mut foot_peak = [0.0f32; 2];
+    let mut foot_prev = [true; 2];
+    let (mut push_sum, mut push_n, mut clear_sum, mut clear_n, mut tilt_sum) = (0.0f32, 0u32, 0.0f32, 0u32, 0.0f32);
     let mut push_idx = 0;
     // Pushes are 0.1 s force pulses: instantaneous impulses on a multibody link get overwritten
     // when Rapier syncs link velocities from the multibody's generalized velocities.
@@ -198,6 +210,24 @@ pub fn run_with(sc: &Scenario, mk: &dyn Fn() -> Box<dyn Ctl>) -> (Metrics, Optio
             break;
         }
 
+        let mut toe = [0.0f32; 2];
+        let mut contact = [false; 2];
+        for k in 0..2 {
+            let fb = &w.bodies[r.legs[k].bodies[robot::B_FOOT]];
+            let f = *fb.rotation() * Vector::Z;
+            toe[k] = (-f.y).atan2((f.x * f.x + f.z * f.z).sqrt()).to_degrees();
+            contact[k] = foot_in_contact(&w, &r.legs[k]);
+            let rest = sc.platform.map_or(0.0, |p| p.0) + 0.08;
+            if t > 2.0 {
+                if contact[k] != foot_prev[k] {
+                    // Phase ended: record its peak.
+                    if foot_prev[k] { push_sum += foot_peak[k]; push_n += 1 } else { clear_sum += foot_peak[k]; clear_n += 1 }
+                    foot_peak[k] = 0.0;
+                }
+                foot_peak[k] = foot_peak[k].max(if contact[k] { toe[k] } else { fb.translation().y - rest });
+            }
+            foot_prev[k] = contact[k];
+        }
         let fallen = tel.trunk_tilt > 0.9 || tel.com[1] - sc.platform.map_or(0.0, |p| p.0).min(tel.com[1]) < 1.2;
         let fallen = fallen || tel.com[1] < 1.2;
         if std::env::var("WDEBUG").is_ok() && i % 6 == 0 {
@@ -219,6 +249,7 @@ pub fn run_with(sc: &Scenario, mk: &dyn Fn() -> Box<dyn Ctl>) -> (Metrics, Optio
             } else {
                 in_air = false;
             }
+            tilt_sum += tel.trunk_tilt.to_degrees();
             ysum += tel.com[1] as f64;
             y2sum += (tel.com[1] as f64).powi(2);
             samples += 1;
@@ -244,6 +275,8 @@ pub fn run_with(sc: &Scenario, mk: &dyn Fn() -> Box<dyn Ctl>) -> (Metrics, Optio
                 heading: tel.yaw,
                 cmd_heading: cmd.heading,
                 feet: tel.feet_in_contact,
+                toe,
+                contact,
                 label: if t < label_until { label.clone() } else if fallen { "FALL".into() } else { String::new() },
             });
         }
@@ -274,6 +307,9 @@ pub fn run_with(sc: &Scenario, mk: &dyn Fn() -> Box<dyn Ctl>) -> (Metrics, Optio
         m.mean_stance_slip = slip_sum / s;
         m.flight_fraction = flight as f32 / s;
         m.flight_phases = phases;
+        m.pushoff_deg = if push_n > 0 { push_sum / push_n as f32 } else { 0.0 };
+        m.swing_clearance_m = if clear_n > 0 { clear_sum / clear_n as f32 } else { 0.0 };
+        m.mean_tilt_deg = tilt_sum / s;
         m.mean_flight_ms = if phases > 0 { air_frames as f32 * DT * 1000.0 / phases as f32 } else { 0.0 };
         let mean = ysum / samples as f64;
         m.com_y_std = ((y2sum / samples as f64 - mean * mean).max(0.0)).sqrt() as f32;

@@ -7,7 +7,7 @@ use crate::run_ctl::*;
 use rapier3d::prelude::*;
 use serde::{Deserialize, Serialize};
 
-pub const OBS_DIM: usize = 56;
+pub const OBS_DIM: usize = 58;
 
 /// Contact history the policy is allowed to see (derived from sensors, not from the teacher).
 #[derive(Clone, Copy, Default)]
@@ -81,11 +81,16 @@ pub fn observe(w: &PhysicsWorld, r: &Robot, cmd: Command, tr: &ContactTracker) -
     push((tr.last_stance == 1) as u8 as f32);
     push(tr.t_since_change.min(1.0));
     for i in 0..2 {
-        let a = match r.arms {
-            Some(arms) => limb_angles(w.bodies[arms[i].1].rotation(), &inv_h).0 - tp,
-            None => 0.0,
+        let (a, e) = match &r.arms {
+            Some(arms) => {
+                let up = limb_angles(w.bodies[arms[i].pitch.1].rotation(), &inv_h).0;
+                let el = arms[i].elbow.map(|(_, fb)| limb_angles(w.bodies[fb].rotation(), &inv_h).0 - up).unwrap_or(0.0);
+                (up - tp, el)
+            }
+            None => (0.0, 0.0),
         };
         push(a);
+        push(e);
     }
     debug_assert_eq!(k, OBS_DIM);
     o

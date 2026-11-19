@@ -203,8 +203,12 @@ fn build_spec(name: &str) -> robot::RobotSpec {
     match name {
         "A" => RobotSpec::default(),
         "B" => RobotSpec { foot_scale: 1.3, swing_arms: true, ..Default::default() },
-        "C" => RobotSpec { legs: LegKind::Digitigrade, foot_scale: 1.3, swing_arms: true, reaction_wheels: false },
-        "D" => RobotSpec { legs: LegKind::Digitigrade, foot_scale: 1.3, swing_arms: true, reaction_wheels: true },
+        "C" => RobotSpec { legs: LegKind::Digitigrade, foot_scale: 1.3, swing_arms: true, reaction_wheels: false, ..Default::default() },
+        "D" => RobotSpec { legs: LegKind::Digitigrade, foot_scale: 1.3, swing_arms: true, reaction_wheels: true, ..Default::default() },
+        // Deer legs on hooves, 3-joint arms, reaction wheels.
+        "E" => RobotSpec { legs: LegKind::Deer, foot_scale: 1.0, swing_arms: true, reaction_wheels: true, arm_dof: 3, frame: Default::default() },
+        // E on the mech-proportioned frame.
+        "F" => RobotSpec { legs: LegKind::Deer, foot_scale: 1.0, swing_arms: true, reaction_wheels: true, arm_dof: 3, frame: robot::Frame::Mech },
         _ => panic!("unknown build {name}"),
     }
 }
@@ -241,6 +245,12 @@ fn run_score(build: &str, g: run_ctl::RunGait, assist: f32) -> (f32, Vec<Metrics
             s += 150.0 * m.flight_fraction.min(0.35) + 50.0 - 25.0 * m.speed_err - 5.0 * m.mean_stance_slip;
             if name == "run_show" {
                 s -= 30.0 * m.heading_err_end;
+            }
+            if build == "E" || build == "F" {
+                // Style: real push-off, deer-like high foot lift, upright torso.
+                s += 40.0 * (m.pushoff_deg / 20.0).clamp(0.0, 1.0);
+                s += 40.0 * (m.swing_clearance_m / 0.30).clamp(0.0, 1.0);
+                s -= 2.0 * (m.mean_tilt_deg - 10.0).max(0.0);
             }
         }
         if m.non_finite {
