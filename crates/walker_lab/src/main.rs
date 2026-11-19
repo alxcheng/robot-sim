@@ -254,7 +254,7 @@ fn run_score(build: &str, g: run_ctl::RunGait, assist: f32) -> (f32, Vec<Metrics
             if name == "run_show" {
                 s -= 30.0 * m.heading_err_end;
             }
-            if build == "E" || build == "F" {
+            if build == "E" || build == "F" || build.starts_with('G') {
                 // Style: real push-off, deer-like high foot lift, upright torso. Only counts when the run
                 // actually tracks the command, so the tuner can't trade speed for style.
                 let on_task = (1.0 - m.speed_err / 0.5).clamp(0.0, 1.0) * (1.0 - m.heading_err_end / 0.5).clamp(0.0, 1.0);
@@ -270,6 +270,20 @@ fn run_score(build: &str, g: run_ctl::RunGait, assist: f32) -> (f32, Vec<Metrics
         }
         total += s;
         ms.push(m);
+    }
+    // G builds: also score robustness on two random-command runs (fixed seeds).
+    if build.starts_with('G') {
+        for seed in [11u64, 12] {
+            let sc = random_run_scenario(seed, build, assist, 15.0);
+            let (m, _) = run_with(&sc, &move || Box::new(run_ctl::RunController::new(g, assist)) as Box<dyn controller::Ctl>);
+            let survive = m.sim_seconds / sc.duration;
+            let mut s = 100.0 * survive;
+            if m.falls == 0 {
+                s += 50.0 - 25.0 * m.speed_err;
+            }
+            total += s;
+            ms.push(m);
+        }
     }
     (total, ms)
 }
