@@ -389,9 +389,15 @@ pub fn set_motor(w: &mut PhysicsWorld, j: MultibodyJointHandle, k: usize, target
         if let Some(link) = mb.link_mut(id) {
             link.joint.data.set_motor_model(JointAxis::AngX, MotorModel::ForceBased);
             link.joint.data.set_motor(JointAxis::AngX, target, 0.0, kp, kd);
-            link.joint.data.set_motor_max_force(JointAxis::AngX, MAX_TORQUE[k]);
+            link.joint.data.set_motor_max_force(JointAxis::AngX, MAX_TORQUE[k] * torque_scale());
         }
     }
+}
+
+/// Experiment knob: WTORQUE scales every position-motor torque cap (stronger actuators).
+pub fn torque_scale() -> f32 {
+    static S: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("WTORQUE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0))
 }
 
 /// Velocity motor (used by reaction wheels): torque = factor·(target − ω), capped.
