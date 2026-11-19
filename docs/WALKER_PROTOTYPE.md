@@ -105,3 +105,30 @@ No non-finite values in any run.
    needs the soak in the tuning objective.
 6. **Looks:** the optimizer only rewarded survival, speed and air time, so the runs are crouched, strongly forward-leaning
    sprints with large arm swings. Style terms (posture, arm range, bounce height) are the next tuning step.
+
+---
+
+# Learned policy, step 1: distilling the hand-built runner (behaviour cloning + DAgger)
+
+* **Network:** MLP 56 → 192 → 192 → 30 (tanh), trained in Rust (`policy.rs`, hand-written backprop + Adam, 4 threads).
+* **Observations (56):** command, trunk tilt/rates, centre-of-mass velocity/height, per-leg limb angles and rates,
+  foot positions relative to the CoM, foot contacts, contact-history phase cues, arm angles. All sensor-derived.
+* **Actions (30):** per-joint position targets and stiffness scales for both 7-joint legs, plus two arm targets.
+  Reaction wheels (and assist) stay as hand-coded reflexes.
+* **Training:** teacher = build D running controller, no assist. 24 teacher runs, then 5 DAgger rounds (the network
+  drives, the teacher labels every visited state). ~3 min total on 4 CPU cores.
+
+Fixed evaluation set (turn-and-push run + 9 random 20 s runs; `crates/walker_lab/policies/distill_eval.json`):
+
+| | Falls | Survival | Speed error | Airborne |
+|---|---|---|---|---|
+| Teacher | 2/10 | 94% | 0.51 m/s | 48% |
+| Round 0 (BC only) | 10/10 | 24% | 1.09 | 27% |
+| Round 1 | 7/10 | 78% | 0.63 | 36% |
+| **Round 2** | **0/10** | **100%** | 0.60 | 43% |
+| Round 3 | 2/10 | 92% | 0.39 | 40% |
+| Round 5 | 2/10 | 95% | 0.52 | 44% |
+
+Result: the network reproduces the teacher from round 2. Imitation plateaus at teacher level, so further gains need
+RL fine-tuning (step 2). Round-2 weights: `crates/walker_lab/policies/run_D_a0_distilled_round2.json`.
+Reproduce: `walker_lab distill D 0 5` then `walker_lab evaldistill D 0`.

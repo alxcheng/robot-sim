@@ -1,0 +1,51 @@
+{
+  "round0": {
+    "falls": 10,
+    "mean_airborne": 0.27266326546669006,
+    "mean_speed_err": 1.0855575799942017,
+    "runs": 10,
+    "survival_frac": 0.24240924417972565
+  },
+  "round1": {
+    "falls": 7,
+    "mean_airborne": 0.3635503649711609,
+    "mean_speed_err": 0.6282314658164978,
+    "runs": 10,
+    "survival_frac": 0.7795379757881165
+  },
+  "round2": {
+    "falls": 0,
+    "mean_airborne": 0.43130287528038025,
+    "mean_speed_err": 0.5983856916427612,
+    "runs": 10,
+    "survival_frac": 1.0
+  },
+  "round3": {
+    "falls": 2,
+    "mean_airborne": 0.3998537063598633,
+    "mean_speed_err": 0.3873264491558075,
+    "runs": 10,
+    "survival_frac": 0.9200495481491089
+  },
+  "round4": {
+    "falls": 1,
+    "mean_airborne": 0.4627196788787842,
+    "mean_speed_err": 0.646260678768158,
+    "runs": 10,
+    "survival_frac": 0.9661716222763062
+  },
+  "round5": {
+    "falls": 2,
+    "mean_airborne": 0.43849557638168335,
+    "mean_speed_err": 0.5177974104881287,
+    "runs": 10,
+    "survival_frac": 0.9503300786018372
+  },
+  "teacher": {
+    "falls": 2,
+    "mean_airborne": 0.480167955160141,
+    "mean_speed_err": 0.51378333568573,
+    "runs": 10,
+    "survival_frac": 0.9448844790458679
+  }
+}

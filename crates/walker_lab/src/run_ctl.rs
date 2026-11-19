@@ -162,6 +162,18 @@ impl Ctl for RunController {
     }
 
     fn tick(&mut self, w: &mut PhysicsWorld, r: &Robot, cmd: Command, dt: f32) -> Telemetry {
+        let (act, stance_leg) = self.compute(w, r, cmd, dt);
+        apply_action(w, r, &act, self.g.kd);
+        let lean_des = self.g.lean + self.g.lean_v * cmd.speed;
+        reflexes(w, r, self.g.wheel_k, self.assist, lean_des);
+        telemetry(w, r, stance_leg)
+    }
+}
+
+impl RunController {
+    /// Compute the teacher's joint targets without touching the world (also used to label
+    /// states visited by a student policy).
+    pub fn compute(&mut self, w: &PhysicsWorld, r: &Robot, cmd: Command, dt: f32) -> (Action, Option<usize>) {
         let g = self.g;
         let spec = r.spec;
         let lmax = max_leg_len(&spec);
@@ -227,7 +239,7 @@ impl Ctl for RunController {
         let phi_f = ((v_f * t_st * 0.5 + g.k_r * (v_f - cmd.speed)) / len0).clamp(-0.7, 0.7).asin();
         let phi_l_base = ((v_l * t_st * 0.5 + g.k_rl * v_l) / len0).clamp(-0.5, 0.5).asin();
 
-        let mut targets: Vec<(MultibodyJointHandle, usize, f32, &JointGains)> = Vec::new();
+        let mut act = Action::default();
         let foot_parent = |leg: &Leg| leg.meta.map(|m| m.1).unwrap_or(leg.bodies[B_SHIN]);
 
         let (stance_leg, free_mode): (Option<usize>, [u8; 2]) = match self.phase {
@@ -249,7 +261,6 @@ impl Ctl for RunController {
         for (i, leg) in r.legs.iter().enumerate() {
             let (th_p, th_r) = ang(leg.bodies[B_THIGH]);
             let (fp_p, fp_r) = ang(foot_parent(leg));
-            let j = leg.joints;
             let mode = if stance_leg == Some(i) { 0 } else { free_mode[i].max(1) };
             if mode == 0 {
                 let frac = self.t / t_st;
@@ -257,15 +268,13 @@ impl Ctl for RunController {
                 let len = if pushing { g.l_push } else { g.l_comp } * lmax;
                 let (qk, qm, _) = leg_ik(&spec, len, g.couple);
                 let foot_yaw = yaw_of(w.bodies[leg.bodies[B_FOOT]].rotation());
-                targets.push((j[HIP_YAW], HIP_YAW, wrap(foot_yaw - cmd.heading).clamp(-0.35, 0.35), &gains));
-                targets.push((j[HIP_ROLL], HIP_ROLL, th_r, &stiff));
-                targets.push((j[HIP_PITCH], HIP_PITCH, th_p - lean_des, &stiff));
-                targets.push((j[KNEE], KNEE, qk, &spring));
-                if let Some((jm, _)) = leg.meta {
-                    targets.push((jm, META, qm, &spring));
-                }
-                targets.push((j[ANKLE_PITCH], ANKLE_PITCH, -fp_p - if pushing { g.toe_push } else { 0.0 }, &gains));
-                targets.push((j[ANKLE_ROLL], ANKLE_ROLL, -fp_r, &gains));
+                act.set(i, S_YAW, wrap(foot_yaw - cmd.heading).clamp(-0.35, 0.35), gains.kp);
+                act.set(i, S_ROLL, th_r, stiff.kp);
+                act.set(i, S_PITCH, th_p - lean_des, stiff.kp);
+                act.set(i, S_KNEE, qk, spring.kp);
+                act.set(i, S_META, qm, spring.kp);
+                act.set(i, S_FPITCH, -fp_p - if pushing { g.toe_push } else { 0.0 }, gains.kp);
+                act.set(i, S_FROLL, -fp_r, gains.kp);
             } else {
                 let (len_frac, pitch) = match mode {
                     1 => (g.l_swing, -phi_f),
@@ -275,69 +284,145 @@ impl Ctl for RunController {
                 let (qk, qm, p0) = leg_ik(&spec, len_frac * lmax, g.couple);
                 let roll = leg.side * g.width + phi_l_base;
                 let hip_pitch = if mode == 3 { th_p - tr_pitch } else { pitch - p0 - tr_pitch };
-                targets.push((j[HIP_YAW], HIP_YAW, heading_err.clamp(-0.35, 0.35), &gains));
-                targets.push((j[HIP_ROLL], HIP_ROLL, (roll - tr_roll).clamp(-0.6, 0.6), &gains));
-                targets.push((j[HIP_PITCH], HIP_PITCH, hip_pitch, &gains));
-                targets.push((j[KNEE], KNEE, qk, &gains));
-                if let Some((jm, _)) = leg.meta {
-                    targets.push((jm, META, qm, &gains));
-                }
-                targets.push((j[ANKLE_PITCH], ANKLE_PITCH, -fp_p, &gains));
-                targets.push((j[ANKLE_ROLL], ANKLE_ROLL, -fp_r, &gains));
+                act.set(i, S_YAW, heading_err.clamp(-0.35, 0.35), gains.kp);
+                act.set(i, S_ROLL, (roll - tr_roll).clamp(-0.6, 0.6), gains.kp);
+                act.set(i, S_PITCH, hip_pitch, gains.kp);
+                act.set(i, S_KNEE, qk, gains.kp);
+                act.set(i, S_META, qm, gains.kp);
+                act.set(i, S_FPITCH, -fp_p, gains.kp);
+                act.set(i, S_FROLL, -fp_r, gains.kp);
             }
         }
 
         // Arms counter-swing against the same-side leg.
-        let mut arm_targets = Vec::new();
-        if let Some(arms) = r.arms {
-            for (i, (ja, _)) in arms.iter().enumerate() {
+        if r.arms.is_some() {
+            for i in 0..2 {
                 let (th_p, _) = ang(r.legs[i].bodies[B_THIGH]);
-                arm_targets.push((*ja, (-g.arm_k * (th_p - tr_pitch)).clamp(-1.0, 1.0)));
+                act.arms[i] = (-g.arm_k * (th_p - tr_pitch)).clamp(-1.0, 1.0);
             }
         }
-        for (jh, k, t, gg) in targets {
-            set_motor(w, jh, k, t, gg);
-        }
-        let arm_g = JointGains { kp: 1.0, kd: 0.08 };
-        for (ja, t) in arm_targets {
-            set_motor(w, ja, ARM, t, &arm_g);
-        }
+        (act, stance_leg)
+    }
+}
 
-        // Trunk stabilising torque wanted (heading frame): used by reaction wheels (internal) and assist (external).
-        let om = inv_h * w.bodies[r.trunk].angvel();
-        let tau_pd = Vector::new(-(90_000.0 * (tr_pitch - lean_des) + 20_000.0 * om.x), 0.0, -(90_000.0 * tr_roll + 20_000.0 * om.z));
-        let tau_world = Rotation::from_rotation_y(yaw) * tau_pd;
-        for wh in &r.wheels {
-            let axis_w = trunk_rot * wh.axis;
-            let rel = (w.bodies[wh.body].angvel() - w.bodies[r.trunk].angvel()).dot(axis_w);
-            // Motor torque on the wheel reacts on the trunk with the opposite sign.
-            let tau_m = -g.wheel_k * tau_world.dot(axis_w);
-            let factor = 2_000.0;
-            let mut target = rel + tau_m / factor;
-            // Saturation + slow desaturation so the wheel can't spin up forever.
-            target -= 0.02 * rel;
-            target = target.clamp(-250.0, 250.0);
-            set_velocity_motor(w, wh.joint, target, factor, 25_000.0);
-        }
-        let trunk = &mut w.bodies[r.trunk];
-        trunk.reset_torques(true);
-        if self.assist > 0.0 {
-            trunk.add_torque(tau_world * self.assist, true);
-        }
+pub const S_YAW: usize = 0;
+pub const S_ROLL: usize = 1;
+pub const S_PITCH: usize = 2;
+pub const S_KNEE: usize = 3;
+pub const S_META: usize = 4;
+pub const S_FPITCH: usize = 5;
+pub const S_FROLL: usize = 6;
+const SLOT_JOINT: [usize; 7] = [HIP_YAW, HIP_ROLL, HIP_PITCH, KNEE, META, ANKLE_PITCH, ANKLE_ROLL];
 
+/// Everything a leg/arm controller decides each tick: per-joint position targets and stiffness
+/// scales (×BASE_KP), plus arm targets. This is the interface a learned policy imitates.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Action {
+    pub legs: [[f32; 7]; 2],
+    pub kp: [[f32; 7]; 2],
+    pub arms: [f32; 2],
+}
+
+pub const ACTION_DIM: usize = 30;
+
+impl Action {
+    pub fn set(&mut self, leg: usize, slot: usize, target: f32, kp: f32) {
+        self.legs[leg][slot] = target;
+        self.kp[leg][slot] = kp;
+    }
+    pub fn to_vec(&self) -> [f32; ACTION_DIM] {
+        let mut v = [0.0; ACTION_DIM];
+        for l in 0..2 {
+            for k in 0..7 {
+                v[l * 7 + k] = self.legs[l][k];
+                v[14 + l * 7 + k] = self.kp[l][k];
+            }
+        }
+        v[28] = self.arms[0];
+        v[29] = self.arms[1];
+        v
+    }
+    pub fn from_slice(v: &[f32]) -> Self {
+        let mut a = Action::default();
+        for l in 0..2 {
+            for k in 0..7 {
+                a.legs[l][k] = v[l * 7 + k];
+                a.kp[l][k] = v[14 + l * 7 + k].clamp(0.1, 4.0);
+            }
+        }
+        a.arms = [v[28], v[29]];
+        a
+    }
+}
+
+pub fn apply_action(w: &mut PhysicsWorld, r: &Robot, a: &Action, kd: f32) {
+    for (i, leg) in r.legs.iter().enumerate() {
+        for k in 0..7 {
+            let jh = if k == S_META {
+                match leg.meta {
+                    Some((jm, _)) => jm,
+                    None => continue,
+                }
+            } else {
+                leg.joints[SLOT_JOINT[k]]
+            };
+            set_motor(w, jh, SLOT_JOINT[k], a.legs[i][k], &JointGains { kp: a.kp[i][k], kd });
+        }
+    }
+    if let Some(arms) = r.arms {
+        for (i, (ja, _)) in arms.iter().enumerate() {
+            set_motor(w, *ja, ARM, a.arms[i], &JointGains { kp: 1.0, kd: 0.08 });
+        }
+    }
+}
+
+/// Low-level reflexes kept outside any learned policy: reaction wheels (internal torque) and the
+/// optional external upright assist.
+pub fn reflexes(w: &mut PhysicsWorld, r: &Robot, wheel_k: f32, assist: f32, lean_des: f32) {
+    let trunk_rot = *w.bodies[r.trunk].rotation();
+    let yaw = yaw_of(&trunk_rot);
+    let inv_h = Rotation::from_rotation_y(-yaw);
+    let (tr_pitch, tr_roll) = trunk_angles(&trunk_rot, &inv_h);
+    let om = inv_h * w.bodies[r.trunk].angvel();
+    let tau_pd = Vector::new(-(90_000.0 * (tr_pitch - lean_des) + 20_000.0 * om.x), 0.0, -(90_000.0 * tr_roll + 20_000.0 * om.z));
+    let tau_world = Rotation::from_rotation_y(yaw) * tau_pd;
+    for wh in &r.wheels {
+        let axis_w = trunk_rot * wh.axis;
+        let rel = (w.bodies[wh.body].angvel() - w.bodies[r.trunk].angvel()).dot(axis_w);
+        // Motor torque on the wheel reacts on the trunk with the opposite sign.
+        let tau_m = -wheel_k * tau_world.dot(axis_w);
+        let factor = 2_000.0;
+        let mut target = rel + tau_m / factor;
+        target -= 0.02 * rel; // slow desaturation
+        target = target.clamp(-250.0, 250.0);
+        set_velocity_motor(w, wh.joint, target, factor, 25_000.0);
+    }
+    let trunk = &mut w.bodies[r.trunk];
+    trunk.reset_torques(true);
+    if assist > 0.0 {
+        trunk.add_torque(tau_world * assist, true);
+    }
+}
+
+pub fn telemetry(w: &PhysicsWorld, r: &Robot, stance_leg: Option<usize>) -> Telemetry {
+    let trunk_rot = *w.bodies[r.trunk].rotation();
+    let yaw = yaw_of(&trunk_rot);
+    let inv_h = Rotation::from_rotation_y(-yaw);
+    let (com, com_vel) = centre_of_mass(w, r);
+    let c = [foot_in_contact(w, &r.legs[0]), foot_in_contact(w, &r.legs[1])];
+    let stance_leg = stance_leg.or(if c[0] { Some(0) } else if c[1] { Some(1) } else { None });
         let st_foot_v = match stance_leg {
             Some(s) => w.bodies[r.legs[s].bodies[B_FOOT]].linvel(),
             None => Vector::ZERO,
         };
-        let up = trunk_rot * Vector::Y;
-        Telemetry {
+    let up = trunk_rot * Vector::Y;
+    Telemetry {
             com: com.to_array(),
             com_vel: com_vel.to_array(),
-            fwd_speed: v_f,
+            fwd_speed: (inv_h * com_vel).z,
             trunk_tilt: up.y.clamp(-1.0, 1.0).acos(),
             yaw,
             stance_foot_slip: (st_foot_v.x * st_foot_v.x + st_foot_v.z * st_foot_v.z).sqrt(),
             feet_in_contact: c[0] as u8 + c[1] as u8,
         }
-    }
 }

@@ -8,6 +8,7 @@
 //!   walker_lab report                                all of the above into out/report.json
 
 mod controller;
+mod policy;
 mod robot;
 mod run_ctl;
 mod sim;
@@ -345,6 +346,161 @@ fn run_report() {
     fs::write("out/run_report.json", &s).unwrap();
 }
 
+// ---------------- distillation (behaviour cloning + DAgger) ----------------
+
+fn random_run_scenario(seed: u64, build: &str, assist: f32, dur: f32) -> Scenario {
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut sc = scenario("run_mid", assist);
+    sc.spec = build_spec(build);
+    sc.duration = dur;
+    sc.commands.clear();
+    let (mut t, mut heading) = (0.0, 0.0);
+    while t < dur {
+        heading += (rng.f() - 0.5) * 0.8;
+        sc.commands.push(cmd(t, 1.2 + rng.f() * 2.0, heading));
+        if rng.f() < 0.4 {
+            let a = rng.f() * std::f32::consts::TAU;
+            sc.pushes.push(Push { t: t + 2.5, dv_fwd: 0.15 * a.cos(), dv_left: 0.15 * a.sin() });
+        }
+        t += 5.0;
+    }
+    sc
+}
+
+type Data = std::sync::Arc<std::sync::Mutex<Vec<(Vec<f32>, Vec<f32>)>>>;
+
+fn collect(build: &str, assist: f32, g: run_ctl::RunGait, student: Option<std::sync::Arc<policy::Mlp>>, episodes: usize, seed0: u64) -> (Vec<(Vec<f32>, Vec<f32>)>, f32) {
+    let out: Data = Default::default();
+    let survived = std::sync::Mutex::new(0.0f32);
+    std::thread::scope(|s| {
+        for t in 0..4 {
+            let (out, student, survived) = (out.clone(), student.clone(), &survived);
+            s.spawn(move || {
+                for e in (t..episodes).step_by(4) {
+                    let sc = random_run_scenario(seed0 + e as u64, build, assist, 20.0);
+                    let (o, st) = (out.clone(), student.clone());
+                    let (m, _) = run_with(&sc, &move || {
+                        Box::new(policy::Recorder {
+                            teacher: run_ctl::RunController::new(g, assist),
+                            student: st.clone(),
+                            tracker: Default::default(),
+                            data: o.clone(),
+                        }) as Box<dyn controller::Ctl>
+                    });
+                    *survived.lock().unwrap() += m.sim_seconds;
+                }
+            });
+        }
+    });
+    let d = std::mem::take(&mut *out.lock().unwrap());
+    (d, survived.into_inner().unwrap() / episodes as f32)
+}
+
+fn eval_student(build: &str, assist: f32, g: run_ctl::RunGait, net: std::sync::Arc<policy::Mlp>, name: &str, clip: Option<(&str, f32)>) -> Metrics {
+    let mut sc = scenario("run_show", assist);
+    sc.spec = build_spec(build);
+    sc.name = name.into();
+    sc.record = clip.is_some();
+    let (m, rec) = run_with(&sc, &move || {
+        Box::new(policy::StudentController { net: net.clone(), tracker: Default::default(), gait: g, assist, steps: 0 }) as Box<dyn controller::Ctl>
+    });
+    if let (Some((path, len)), Some(mut rec)) = (clip, rec) {
+        // Short clip: the 3 m/s stretch if it survives, else the seconds leading into the fall.
+        let end = match m.first_fall_t { Some(t) => t + 1.5, None => 13.0 };
+        let start = (end - len).max(0.0);
+        rec.frames.retain(|f| f.t >= start && f.t <= end);
+        fs::write(path, serde_json::to_string(&rec).unwrap()).unwrap();
+    }
+    m
+}
+
+fn distill(build: &str, assist: f32, iters: usize) {
+    let g = load_run_gait(build, assist);
+    fs::create_dir_all("out/distill").ok();
+    // Teacher clip for reference.
+    {
+        let mut sc = scenario("run_show", assist);
+        sc.spec = build_spec(build);
+        sc.name = "TEACHER · hand-built controller".into();
+        sc.record = true;
+        let (_, rec) = run_with(&sc, &move || Box::new(run_ctl::RunController::new(g, assist)) as Box<dyn controller::Ctl>);
+        let mut rec = rec.unwrap();
+        rec.frames.retain(|f| f.t >= 7.0 && f.t <= 13.0);
+        fs::write("out/distill/clip_teacher.json", serde_json::to_string(&rec).unwrap()).unwrap();
+    }
+    let (mut data, teacher_surv) = collect(build, assist, g, None, 24, 1000);
+    println!("teacher data: {} samples, mean survival {:.1}/20 s", data.len(), teacher_surv);
+    let mut net = policy::Mlp::new(&[policy::OBS_DIM, 192, 192, run_ctl::ACTION_DIM], 7);
+    {
+        let xs: Vec<Vec<f32>> = data.iter().map(|d| d.0.clone()).collect();
+        let ys: Vec<Vec<f32>> = data.iter().map(|d| d.1.clone()).collect();
+        net.fit_normalisation(&xs, &ys);
+    }
+    let mut opt = net.adam();
+    let mut log = Vec::new();
+    for it in 0..=iters {
+        let xs: Vec<Vec<f32>> = data.iter().map(|d| d.0.clone()).collect();
+        let ys: Vec<Vec<f32>> = data.iter().map(|d| d.1.clone()).collect();
+        let epochs = if it == 0 { 12 } else { 6 };
+        let mut loss = 0.0;
+        let t0 = std::time::Instant::now();
+        for e in 0..epochs {
+            loss = net.train_epoch(&mut opt, &xs, &ys, 512, 1e-3, (it * 100 + e) as u64 + 1);
+        }
+        let train_s = t0.elapsed().as_secs_f32();
+        let arc = std::sync::Arc::new(net.clone());
+        let m = eval_student(build, assist, g, arc.clone(), &format!("STUDENT · DAgger round {it}"),
+            Some((&format!("out/distill/clip_round{it}.json"), 6.0)));
+        println!("round {it}: {} samples, loss {:.4}, train {:.0}s | run_show: survived {:.1}/22 s, speed {:.2}, airborne {:.2}",
+            data.len(), loss, train_s, m.sim_seconds, m.mean_speed, m.flight_fraction);
+        log.push(serde_json::json!({"round": it, "samples": data.len(), "loss": loss, "eval": m}));
+        fs::write(format!("out/distill/net_round{it}.json"), serde_json::to_string(&net).unwrap()).unwrap();
+        fs::write("out/distill/log.json", serde_json::to_string_pretty(&log).unwrap()).unwrap();
+        if it < iters {
+            let (more, surv) = collect(build, assist, g, Some(arc), 24, 5000 + it as u64 * 100);
+            println!("   student rollouts: +{} samples, mean survival {:.1}/20 s", more.len(), surv);
+            data.extend(more);
+        }
+    }
+}
+
+/// Fixed evaluation set: the turn-and-push run plus 9 random 20 s runs (seeds disjoint from training).
+fn eval_set(build: &str, assist: f32, mk: &(dyn Fn() -> Box<dyn controller::Ctl> + Sync)) -> serde_json::Value {
+    let mut scs = vec![{ let mut s = scenario("run_show", assist); s.spec = build_spec(build); s }];
+    for k in 0..9 {
+        scs.push(random_run_scenario(90_000 + k, build, assist, 20.0));
+    }
+    let ms: Vec<Metrics> = std::thread::scope(|s| {
+        let hs: Vec<_> = scs.iter().map(|sc| s.spawn(move || run_with(sc, mk).0)).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let total: f32 = scs.iter().map(|s| s.duration).sum();
+    let surv: f32 = ms.iter().map(|m| m.sim_seconds).sum();
+    let falls = ms.iter().filter(|m| m.falls > 0).count();
+    let speed_err: f32 = ms.iter().map(|m| m.speed_err).sum::<f32>() / ms.len() as f32;
+    let air: f32 = ms.iter().map(|m| m.flight_fraction).sum::<f32>() / ms.len() as f32;
+    serde_json::json!({"runs": ms.len(), "falls": falls, "survival_frac": surv / total, "mean_speed_err": speed_err, "mean_airborne": air})
+}
+
+fn eval_distill(build: &str, assist: f32) {
+    let g = load_run_gait(build, assist);
+    let mut out = serde_json::Map::new();
+    out.insert("teacher".into(), eval_set(build, assist, &move || Box::new(run_ctl::RunController::new(g, assist)) as Box<dyn controller::Ctl>));
+    for r in 0.. {
+        let Ok(s) = fs::read_to_string(format!("out/distill/net_round{r}.json")) else { break };
+        let net = std::sync::Arc::new(serde_json::from_str::<policy::Mlp>(&s).unwrap());
+        out.insert(format!("round{r}"), eval_set(build, assist, &move || {
+            Box::new(policy::StudentController { net: net.clone(), tracker: Default::default(), gait: g, assist, steps: 0 }) as Box<dyn controller::Ctl>
+        }));
+    }
+    let s = serde_json::to_string_pretty(&out).unwrap();
+    fs::write("out/distill/eval.json", &s).unwrap();
+    for (k, v) in &out {
+        println!("{k:8} falls {}/{}  survival {:.0}%  speed err {:.2}  airborne {:.0}%", v["falls"], v["runs"],
+            v["survival_frac"].as_f64().unwrap() * 100.0, v["mean_speed_err"].as_f64().unwrap(), v["mean_airborne"].as_f64().unwrap() * 100.0);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let a = |i: usize| args.get(i).cloned();
@@ -368,6 +524,8 @@ fn main() {
         }
         Some("diag") => diag(),
         Some("runreport") => run_report(),
+        Some("evaldistill") => eval_distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
+        Some("distill") => distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0), a(4).map(|s| s.parse().unwrap()).unwrap_or(5)),
         Some("runtune") => run_tune(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(100), a(4).map(|s| s.parse().unwrap()).unwrap_or(0.35)),
         Some("runrun") => {
             let (b, name) = (a(2).unwrap(), a(3).unwrap());
