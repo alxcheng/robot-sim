@@ -38,6 +38,22 @@ pub struct RunGait {
     pub arm_k: f32,
     pub wheel_k: f32,
     pub couple: f32,
+    /// Fraction of the stance at which the swing leg starts reaching for the ground (later = longer swing).
+    #[serde(default = "reach_default")]
+    pub reach_at: f32,
+    /// Extra forward landing angle (rad) on top of Raibert placement: longer strides.
+    #[serde(default)]
+    pub stride_k: f32,
+    /// Minimum stance time before the other foot may take over (s).
+    #[serde(default = "min_stance_default")]
+    pub min_stance: f32,
+}
+
+fn reach_default() -> f32 {
+    0.55
+}
+fn min_stance_default() -> f32 {
+    0.15
 }
 
 impl Default for RunGait {
@@ -61,11 +77,14 @@ impl Default for RunGait {
             arm_k: 0.8,
             wheel_k: 0.6,
             couple: 1.0,
+            reach_at: 0.55,
+            stride_k: 0.0,
+            min_stance: 0.15,
         }
     }
 }
 
-pub const RUN_BOUNDS: [(f32, f32, f32); 18] = [
+pub const RUN_BOUNDS: [(f32, f32, f32); 21] = [
     // (min, max, perturbation scale)
     (0.18, 0.6, 0.03),  // t_st
     (0.80, 0.99, 0.02), // l0
@@ -85,19 +104,22 @@ pub const RUN_BOUNDS: [(f32, f32, f32); 18] = [
     (0.0, 2.0, 0.1),    // arm_k
     (0.0, 2.0, 0.1),    // wheel_k
     (0.3, 1.4, 0.05),   // couple
+    (0.3, 1.6, 0.06),   // reach_at
+    (0.0, 0.45, 0.03),  // stride_k
+    (0.08, 0.45, 0.02), // min_stance
 ];
 
 impl RunGait {
-    pub fn to_vec(&self) -> [f32; 18] {
+    pub fn to_vec(&self) -> [f32; 21] {
         [self.t_st, self.l0, self.l_comp, self.l_push, self.push_start, self.l_swing, self.k_r, self.k_rl, self.width,
-         self.lean, self.lean_v, self.kp, self.kd, self.leg_k, self.toe_push, self.arm_k, self.wheel_k, self.couple]
+         self.lean, self.lean_v, self.kp, self.kd, self.leg_k, self.toe_push, self.arm_k, self.wheel_k, self.couple, self.reach_at, self.stride_k, self.min_stance]
     }
-    pub fn from_vec(v: &[f32; 18]) -> Self {
+    pub fn from_vec(v: &[f32; 21]) -> Self {
         let c = |i: usize| v[i].clamp(RUN_BOUNDS[i].0, RUN_BOUNDS[i].1);
         RunGait {
             t_st: c(0), l0: c(1), l_comp: c(2), l_push: c(3), push_start: c(4), l_swing: c(5), k_r: c(6), k_rl: c(7),
             width: c(8), lean: c(9), lean_v: c(10), kp: c(11), kd: c(12), leg_k: c(13), toe_push: c(14), arm_k: c(15),
-            wheel_k: c(16), couple: c(17),
+            wheel_k: c(16), couple: c(17), reach_at: c(18), stride_k: c(19), min_stance: c(20),
         }
     }
 }
@@ -194,7 +216,7 @@ impl RunController {
                     self.t_st_est = 0.8 * self.t_st_est + 0.2 * self.t.clamp(0.1, 0.8);
                     self.t = 0.0;
                     Phase::Flight(s)
-                } else if c[o] && self.t > 0.15 {
+                } else if c[o] && self.t > g.min_stance {
                     self.t_st_est = 0.8 * self.t_st_est + 0.2 * self.t.clamp(0.1, 0.8);
                     self.t = 0.0;
                     self.steps += 1;
@@ -236,7 +258,7 @@ impl RunController {
         // Raibert landing angles.
         let len0 = g.l0 * lmax;
         let t_st = self.t_st_est;
-        let phi_f = ((v_f * t_st * 0.5 + g.k_r * (v_f - cmd.speed)) / len0).clamp(-0.7, 0.7).asin();
+        let phi_f = ((v_f * t_st * 0.5 + g.k_r * (v_f - cmd.speed)) / len0).clamp(-0.7, 0.7).asin() + g.stride_k * (cmd.speed / 3.0).clamp(0.0, 1.0);
         let phi_l_base = ((v_l * t_st * 0.5 + g.k_rl * v_l) / len0).clamp(-0.5, 0.5).asin();
 
         let mut act = Action::default();
@@ -247,7 +269,7 @@ impl RunController {
             Phase::Stance(s) => {
                 let frac = self.t / t_st;
                 let mut m = [0u8; 2];
-                m[1 - s] = if frac < 0.55 { 1 } else { 2 };
+                m[1 - s] = if frac < g.reach_at { 1 } else { 2 };
                 (Some(s), m)
             }
             Phase::Flight(s) => {
