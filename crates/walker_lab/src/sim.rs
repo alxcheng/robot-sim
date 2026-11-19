@@ -57,6 +57,9 @@ pub struct Metrics {
     /// Mean, over swing phases, of the highest the swinging foot rises.
     pub swing_clearance_m: f32,
     pub mean_tilt_deg: f32,
+    /// Mean distance the body travels between consecutive footfalls (step length), and footfalls per second.
+    pub step_len_m: f32,
+    pub cadence_hz: f32,
     pub non_finite: bool,
     pub max_tilt_deg: f32,
     pub wall_ms: f64,
@@ -159,6 +162,7 @@ pub fn run_with(sc: &Scenario, mk: &dyn Fn() -> Box<dyn Ctl>) -> (Metrics, Optio
     // Per-foot phase trackers for push-off and swing clearance.
     let mut foot_peak = [0.0f32; 2];
     let mut foot_prev = [true; 2];
+    let (mut last_td_pos, mut step_sum, mut step_n) = (None::<[f32; 2]>, 0.0f32, 0u32);
     let (mut push_sum, mut push_n, mut clear_sum, mut clear_n, mut tilt_sum) = (0.0f32, 0u32, 0.0f32, 0u32, 0.0f32);
     let mut push_idx = 0;
     // Pushes are 0.1 s force pulses: instantaneous impulses on a multibody link get overwritten
@@ -219,6 +223,18 @@ pub fn run_with(sc: &Scenario, mk: &dyn Fn() -> Box<dyn Ctl>) -> (Metrics, Optio
             contact[k] = foot_in_contact(&w, &r.legs[k]);
             let rest = sc.platform.map_or(0.0, |p| p.0) + 0.08;
             if t > 2.0 {
+                if contact[k] && !foot_prev[k] {
+                    // Touchdown: body travel since the previous footfall = step length.
+                    let p = [tel.com[0], tel.com[2]];
+                    if let Some(q) = last_td_pos {
+                        let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
+                        if d < 6.0 {
+                            step_sum += d;
+                            step_n += 1;
+                        }
+                    }
+                    last_td_pos = Some(p);
+                }
                 if contact[k] != foot_prev[k] {
                     // Phase ended: record its peak.
                     if foot_prev[k] { push_sum += foot_peak[k]; push_n += 1 } else { clear_sum += foot_peak[k]; clear_n += 1 }
@@ -310,6 +326,8 @@ pub fn run_with(sc: &Scenario, mk: &dyn Fn() -> Box<dyn Ctl>) -> (Metrics, Optio
         m.pushoff_deg = if push_n > 0 { push_sum / push_n as f32 } else { 0.0 };
         m.swing_clearance_m = if clear_n > 0 { clear_sum / clear_n as f32 } else { 0.0 };
         m.mean_tilt_deg = tilt_sum / s;
+        m.step_len_m = if step_n > 0 { step_sum / step_n as f32 } else { 0.0 };
+        m.cadence_hz = step_n as f32 / (s * DT);
         m.mean_flight_ms = if phases > 0 { air_frames as f32 * DT * 1000.0 / phases as f32 } else { 0.0 };
         let mean = ysum / samples as f64;
         m.com_y_std = ((y2sum / samples as f64 - mean * mean).max(0.0)).sqrt() as f32;
