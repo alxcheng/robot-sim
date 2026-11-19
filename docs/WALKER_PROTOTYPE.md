@@ -94,8 +94,8 @@ No non-finite values in any run.
 
 ## Findings
 1. **A real run exists now**, with dozens of genuine airborne phases of 130–290 ms per run, up to ~3 m/s.
-2. **Digitigrade legs were the biggest single win**: smoother tracking, lower tilt, and the only leg type that also ran
-   with **no assist at all**.
+2. **Digitigrade legs were the biggest single win** at assist 0.35: smoother tracking and lower tilt. They also ran with
+   **no assist at all**. (The biped builds A/B were not tuned at zero assist, so that comparison is still open.)
 3. **Reaction wheels replace most of the external assist**: build D with *zero* assist was the most robust runner
    (5 falls in 5 min of random commands and pushes; 2.1 m/s side push), at the cost of top speed. This is the
    physically honest way to "close the gap".
