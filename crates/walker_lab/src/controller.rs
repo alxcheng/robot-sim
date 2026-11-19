@@ -86,7 +86,7 @@ pub struct Telemetry {
     pub feet_in_contact: u8,
 }
 
-fn wrap(a: f32) -> f32 {
+pub fn wrap(a: f32) -> f32 {
     let mut a = a;
     while a > std::f32::consts::PI {
         a -= 2.0 * std::f32::consts::PI;
@@ -103,13 +103,13 @@ pub fn yaw_of(q: &Rotation) -> f32 {
 }
 
 /// (pitch, roll) of a limb's -Y axis expressed in the heading frame.
-fn limb_angles(q: &Rotation, inv_heading: &Rotation) -> (f32, f32) {
+pub fn limb_angles(q: &Rotation, inv_heading: &Rotation) -> (f32, f32) {
     let d = *inv_heading * (*q * -Vector::Y);
     ((-d.z).atan2(-d.y), d.x.atan2(-d.y))
 }
 
 /// (pitch, roll) of the trunk's +Y axis in the heading frame.
-fn trunk_angles(q: &Rotation, inv_heading: &Rotation) -> (f32, f32) {
+pub fn trunk_angles(q: &Rotation, inv_heading: &Rotation) -> (f32, f32) {
     let u = *inv_heading * (*q * Vector::Y);
     (u.z.atan2(u.y), (-u.x).atan2(u.y))
 }
@@ -131,12 +131,24 @@ pub fn centre_of_mass(w: &PhysicsWorld, r: &Robot) -> (Vector, Vector) {
     (p / m, v / m)
 }
 
+/// Common interface so the scenario runner can drive either controller.
+pub trait Ctl {
+    fn tick(&mut self, w: &mut PhysicsWorld, r: &Robot, cmd: Command, dt: f32) -> Telemetry;
+    fn steps(&self) -> u32;
+}
+
 impl Controller {
     pub fn new(gait: Gait, assist: f32) -> Self {
         Controller { gait, stance: 0, phase_t: 0.0, assist, steps: 0 }
     }
+}
 
-    pub fn tick(&mut self, w: &mut PhysicsWorld, r: &Robot, cmd: Command, dt: f32) -> Telemetry {
+impl Ctl for Controller {
+    fn steps(&self) -> u32 {
+        self.steps
+    }
+
+    fn tick(&mut self, w: &mut PhysicsWorld, r: &Robot, cmd: Command, dt: f32) -> Telemetry {
         let g = self.gait;
         let trunk_rot = *w.bodies[r.trunk].rotation();
         let yaw = yaw_of(&trunk_rot);

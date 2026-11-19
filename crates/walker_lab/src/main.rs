@@ -9,6 +9,7 @@
 
 mod controller;
 mod robot;
+mod run_ctl;
 mod sim;
 
 use controller::Gait;
@@ -157,7 +158,7 @@ fn pushtest(assist: f32) -> serde_json::Value {
         let sc = scenario("walk", assist);
         let mut w = rapier3d::prelude::PhysicsWorld::new();
         let _ = &sc;
-        robot::build(&mut w, rapier3d::prelude::Vector::ZERO).total_mass
+        robot::build(&mut w, rapier3d::prelude::Vector::ZERO, robot::RobotSpec::default()).total_mass
     };
     let side = search(&|dv| survives("push_side", 0.0, dv, g, assist));
     let fwd = search(&|dv| survives("push_fwd", dv, 0.0, g, assist));
@@ -194,6 +195,156 @@ fn soak(seconds: f32, assist: f32) -> Metrics {
     run(&sc, g).0
 }
 
+// ---------------- running experiments ----------------
+
+fn build_spec(name: &str) -> robot::RobotSpec {
+    use robot::{LegKind, RobotSpec};
+    match name {
+        "A" => RobotSpec::default(),
+        "B" => RobotSpec { foot_scale: 1.3, swing_arms: true, ..Default::default() },
+        "C" => RobotSpec { legs: LegKind::Digitigrade, foot_scale: 1.3, swing_arms: true, reaction_wheels: false },
+        "D" => RobotSpec { legs: LegKind::Digitigrade, foot_scale: 1.3, swing_arms: true, reaction_wheels: true },
+        _ => panic!("unknown build {name}"),
+    }
+}
+
+fn run_gait_path(build: &str, assist: f32) -> String {
+    format!("out/run_{build}_a{assist}.json")
+}
+
+fn load_run_gait(build: &str, assist: f32) -> run_ctl::RunGait {
+    fs::read_to_string(run_gait_path(build, assist))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn run_scenario(build: &str, name: &str, assist: f32, g: run_ctl::RunGait) -> (Metrics, Option<Recording>) {
+    let mut sc = scenario(name, assist);
+    sc.spec = build_spec(build);
+    sc.name = format!("{name} · build {build}");
+    run_with(&sc, &move || Box::new(run_ctl::RunController::new(g, assist)) as Box<dyn controller::Ctl>)
+}
+
+const RUN_SET: [&str; 3] = ["run_mid", "run_fast", "run_show"];
+
+fn run_score(build: &str, g: run_ctl::RunGait, assist: f32) -> (f32, Vec<Metrics>) {
+    let mut total = 0.0;
+    let mut ms = Vec::new();
+    for name in RUN_SET {
+        let (m, _) = run_scenario(build, name, assist, g);
+        let dur = scenario(name, assist).duration;
+        let survive = m.sim_seconds / dur;
+        let mut s = 100.0 * survive + 100.0 * m.flight_fraction.min(0.35) * survive;
+        if m.falls == 0 {
+            s += 150.0 * m.flight_fraction.min(0.35) + 50.0 - 25.0 * m.speed_err - 5.0 * m.mean_stance_slip;
+            if name == "run_show" {
+                s -= 30.0 * m.heading_err_end;
+            }
+        }
+        if m.non_finite {
+            s -= 200.0;
+        }
+        total += s;
+        ms.push(m);
+    }
+    (total, ms)
+}
+
+fn run_tune(build: &str, iters: usize, assist: f32) {
+    fs::create_dir_all("out").ok();
+    let mut best = load_run_gait(build, assist);
+    let (mut best_s, _) = run_score(build, best, assist);
+    println!("[{build}] start score {best_s:.1}");
+    let mut rng = Rng(0xA5A5_1234_9E37_79B9 ^ build.as_bytes()[0] as u64);
+    let mut sigma = 1.5;
+    for it in 0..iters {
+        let cands: Vec<run_ctl::RunGait> = (0..4)
+            .map(|_| {
+                let mut v = best.to_vec();
+                for (i, x) in v.iter_mut().enumerate() {
+                    *x += rng.n() * run_ctl::RUN_BOUNDS[i].2 * sigma;
+                }
+                run_ctl::RunGait::from_vec(&v)
+            })
+            .collect();
+        let results: Vec<(f32, run_ctl::RunGait)> = std::thread::scope(|s| {
+            let hs: Vec<_> = cands.iter().map(|g| s.spawn(move || (run_score(build, *g, assist).0, *g))).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let (s, g) = results.into_iter().fold((f32::MIN, best), |a, b| if b.0 > a.0 { b } else { a });
+        if s > best_s {
+            best_s = s;
+            best = g;
+            sigma = (sigma * 1.15).min(2.5);
+            fs::write(run_gait_path(build, assist), serde_json::to_string_pretty(&best).unwrap()).unwrap();
+            println!("[{build}] iter {it}: score {best_s:.1}");
+        } else {
+            sigma = (sigma * 0.97).max(0.2);
+        }
+    }
+    for m in run_score(build, best, assist).1 {
+        println!("{}", serde_json::to_string(&m).unwrap());
+    }
+}
+
+fn run_survives(build: &str, g: run_ctl::RunGait, assist: f32, dv_left: f32) -> bool {
+    [6.0f32, 6.1, 6.2, 6.3].iter().all(|&t| {
+        let mut sc = scenario("run_mid", assist);
+        sc.spec = build_spec(build);
+        sc.pushes = vec![Push { t, dv_fwd: 0.0, dv_left }];
+        run_with(&sc, &move || Box::new(run_ctl::RunController::new(g, assist)) as Box<dyn controller::Ctl>).0.falls == 0
+    })
+}
+
+fn run_report() {
+    let mut out = Vec::new();
+    for (b, a) in [("A", 0.35f32), ("B", 0.35), ("C", 0.35), ("D", 0.35), ("C", 0.0), ("D", 0.0)] {
+        let g = load_run_gait(b, a);
+        let mut runs = Vec::new();
+        for name in ["run_mid", "run_fast", "run_show"] {
+            runs.push(serde_json::to_value(run_scenario(b, name, a, g).0).unwrap());
+        }
+        let side = {
+            let (mut lo, mut hi) = (0.0f32, 3.0f32);
+            if run_survives(b, g, a, 0.0) {
+                for _ in 0..8 {
+                    let mid = 0.5 * (lo + hi);
+                    if run_survives(b, g, a, mid) { lo = mid } else { hi = mid }
+                }
+                lo
+            } else {
+                0.0
+            }
+        };
+        // Soak: 300 s of random speeds 1.5–3.2 m/s, heading changes and pushes; auto-reset on falls.
+        let mut rng = Rng(7);
+        let mut sc = scenario("run_mid", a);
+        sc.spec = build_spec(b);
+        sc.name = "soak".into();
+        sc.duration = 300.0;
+        sc.reset_on_fall = true;
+        sc.commands.clear();
+        let (mut t, mut heading) = (0.0, 0.0);
+        while t < 300.0 {
+            heading += (rng.f() - 0.5) * 1.0;
+            sc.commands.push(cmd(t, 1.5 + rng.f() * 1.7, heading));
+            if rng.f() < 0.5 {
+                let ang = rng.f() * std::f32::consts::TAU;
+                sc.pushes.push(Push { t: t + 3.0, dv_fwd: 0.15 * ang.cos(), dv_left: 0.15 * ang.sin() });
+            }
+            t += 6.0;
+        }
+        let soak = run_with(&sc, &move || Box::new(run_ctl::RunController::new(g, a)) as Box<dyn controller::Ctl>).0;
+        let mass = robot::build(&mut rapier3d::prelude::PhysicsWorld::new(), rapier3d::prelude::Vector::ZERO, build_spec(b)).total_mass;
+        out.push(serde_json::json!({ "build": b, "spec": build_spec(b), "assist": a, "mass_kg": mass, "gait": g,
+            "scenarios": runs, "max_side_push_dv_mps": side, "soak_300s": soak }));
+        eprintln!("done {b} a{a}");
+    }
+    let s = serde_json::to_string_pretty(&out).unwrap();
+    fs::write("out/run_report.json", &s).unwrap();
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let a = |i: usize| args.get(i).cloned();
@@ -216,6 +367,17 @@ fn main() {
             println!("{}", serde_json::to_string_pretty(&m).unwrap());
         }
         Some("diag") => diag(),
+        Some("runreport") => run_report(),
+        Some("runtune") => run_tune(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(100), a(4).map(|s| s.parse().unwrap()).unwrap_or(0.35)),
+        Some("runrun") => {
+            let (b, name) = (a(2).unwrap(), a(3).unwrap());
+            let assist: f32 = a(4).map(|s| s.parse().unwrap()).unwrap_or(0.35);
+            let (m, rec) = run_scenario(&b, &name, assist, load_run_gait(&b, assist));
+            println!("{}", serde_json::to_string_pretty(&m).unwrap());
+            if let (Some(path), Some(rec)) = (a(5), rec) {
+                fs::write(path, serde_json::to_string(&rec).unwrap()).unwrap();
+            }
+        }
         Some("report") => {
             let mut out = serde_json::Map::new();
             for assist in [1.0f32, 0.35, 0.0] {
@@ -247,7 +409,7 @@ pub fn diag() {
     let mut w = PhysicsWorld::new();
     w.integration_parameters.dt = sim::DT;
     w.integration_parameters.num_solver_iterations = sim::SUBSTEPS;
-    let r = robot::build(&mut w, Vector::new(0.0, 3.0, 0.0));
+    let r = robot::build(&mut w, Vector::new(0.0, 3.0, 0.0), robot::RobotSpec::default());
     w.bodies[r.trunk].set_body_type(RigidBodyType::Fixed, true);
     let g = robot::JointGains { kp: 1.0, kd: 0.12 };
     let l = &r.legs[0];

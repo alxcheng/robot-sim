@@ -15,14 +15,14 @@
 <body>
 <div id="hud"></div>
 <div id="label"></div>
-<div id="legend">walker_lab · Rapier 0.36 multibody · 60 Hz × 4 substeps · SIMBICON-style controller</div>
+<div id="legend">walker_lab · Rapier 0.36 multibody · 60 Hz × 4 substeps · virtual-leg running controller</div>
 <script>
 // Expects window.REC (recording JSON) and THREE to be injected before init() is called.
 let scene, camera, renderer, meshes = [], camPos = null, camTarget = null, arrow = null;
 
 const COLORS = {
   torso: 0xaab4be, reactor: 0x66727e, head: 0xc4ccd3, arm: 0x8d98a3,
-  thigh: 0x8e99a4, shin: 0x8e99a4, foot: 0x4b5560, gimbal: 0x2a323a,
+  thigh: 0x8e99a4, shin: 0x8e99a4, meta: 0x7a8591, foot: 0x4b5560, gimbal: 0x2a323a, wheel: 0x5a6570,
 };
 
 function init(width, height) {
@@ -83,7 +83,13 @@ function init(width, height) {
         const visor = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.06, 0.02), new THREE.MeshBasicMaterial({ color: 0xe3a42c }));
         visor.position.set(s.offset[0], s.offset[1] + 0.02, s.offset[2] + s.half[2] + 0.011); g.add(visor);
       }
-      if (s.tag === 'thigh' || s.tag === 'shin') {
+      if (s.tag === 'wheel') {
+        const ax = s.half[0] < s.half[2] ? 'x' : 'z';
+        const ring = new THREE.Mesh(new THREE.TorusGeometry(0.36, 0.035, 8, 32), new THREE.MeshBasicMaterial({ color: 0xe3a42c }));
+        if (ax === 'x') ring.rotation.y = Math.PI / 2;
+        ring.position.set(...s.offset); g.add(ring);
+      }
+      if (s.tag === 'thigh' || s.tag === 'shin' || s.tag === 'meta') {
         const stripe = new THREE.Mesh(new THREE.BoxGeometry(s.half[0] * 1.2, 0.05, 0.02), new THREE.MeshBasicMaterial({ color: 0xe3a42c }));
         stripe.position.set(s.offset[0], s.offset[1] + s.half[1] * 0.5, s.offset[2] + s.half[2] + 0.011); g.add(stripe);
       }
@@ -124,6 +130,10 @@ function show(i) {
     `speed <b>${f.speed.toFixed(2)}</b> / cmd ${f.cmd_speed.toFixed(2)} m/s<br>` +
     `heading ${(f.heading * 57.3).toFixed(0)}° / cmd ${(f.cmd_heading * 57.3).toFixed(0)}°<br>` +
     `upright assist ${assist}`;
+  if (window.flightCount === undefined) { window.flightCount = 0; window.frameCount = 0; }
+  if (f.t > 2) { window.frameCount++; if (f.feet === 0) window.flightCount++; }
+  const pct = window.frameCount ? Math.round(100 * window.flightCount / window.frameCount) : 0;
+  document.getElementById('hud').innerHTML += `<br>airborne ${pct}% of time` + (f.feet === 0 ? ' <b>● AIRBORNE</b>' : '');
   const lab = document.getElementById('label');
   lab.textContent = f.label; lab.className = f.label === 'FALL' ? 'fall' : '';
   renderer.render(scene, camera);

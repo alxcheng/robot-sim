@@ -58,3 +58,50 @@ cargo run --release -p walker_lab -- run showcase 0 out/rec.json
 cd tools/walker_viewer && npm install && node capture.js ../../out/rec.json ../../out/video 30
 ```
 Tuned gaits are committed in `crates/walker_lab/gaits/` (copy to `out/` to use).
+
+---
+
+# Running (round 2): better parts + a running controller
+
+Goal: an actual run (flight phase), with assistance allowed to close the gap.
+
+## What was added
+* **Parts** (`RobotSpec`): bigger feet (×1.3), **motor-driven swinging arms** (counter-swing against the same-side leg),
+  **digitigrade multi-joint legs** (7 joints: hip yaw/roll/pitch, knee, metatarsal, toe pitch/roll; the metatarsal is
+  coupled opposite to the knee so the leg folds like a spring), and a **reaction-wheel back unit** (pitch + roll
+  wheels, 2 × 100 kg) that gives the trunk internal stabilising torque (legit physics, unlike the external assist).
+  Total mass held at ~3.6 t.
+* **Running controller** (`run_ctl.rs`): each leg is a *virtual leg* (length + angle) solved to joint angles by IK, so the
+  same controller drives biped and digitigrade legs. Stance (compress → extend + toe push-off) → flight → landing at the
+  Raibert angle φ = asin((v·T/2 + k(v − v_cmd))/ℓ). Stance hip servos the trunk.
+* **Flight metrics:** number and mean duration of airborne phases, centre-of-mass bounce.
+
+Builds: **A** baseline biped · **B** biped + swinging arms + big feet · **C** digitigrade + arms + big feet ·
+**D** = C + reaction wheels. Gaits tuned by random search on 2.2 m/s, 3.0 m/s and a turn-and-push run.
+
+## Results (`crates/walker_lab/gaits/run_report.json`)
+
+| Build | Assist | 3.0 m/s cmd: speed | Airborne | Flight phase | Bounce | Turn + push run | Side push (worst phase) | 5-min random soak |
+|---|---|---|---|---|---|---|---|---|
+| A baseline | 0.35 | 2.76 | 37% | 126 ms | 4 cm | ❌ falls | 1.08 m/s | 98 falls |
+| B arms + feet | 0.35 | 2.82 | 44% | 293 ms | 15 cm | ✅ but doesn't turn, feet slide ~0.9 m/s | 1.15 m/s | 2 falls |
+| C digitigrade | 0.35 | 2.75 | 49% | 134 ms | 3 cm | ✅ | 2.38 m/s | 21 falls |
+| **C digitigrade** | **0 (pure physics)** | **2.66** | **45%** | 134 ms | 4 cm | ✅ | 1.30 m/s | 111 falls |
+| D + reaction wheels | 0.35 | 1.98 | 36% | 194 ms | 13 cm | ✅ (slow) | 1.57 m/s | 8 falls |
+| **D + reaction wheels** | **0 (pure physics)** | **2.26** | **43%** | 161 ms | 5 cm | ✅ | **2.10 m/s** | **5 falls** |
+
+No non-finite values in any run.
+
+## Findings
+1. **A real run exists now**, with dozens of genuine airborne phases of 130–290 ms per run, up to ~3 m/s.
+2. **Digitigrade legs were the biggest single win**: smoother tracking, lower tilt, and the only leg type that also ran
+   with **no assist at all**.
+3. **Reaction wheels replace most of the external assist**: build D with *zero* assist was the most robust runner
+   (5 falls in 5 min of random commands and pushes; 2.1 m/s side push), at the cost of top speed. This is the
+   physically honest way to "close the gap".
+4. **Swinging arms + big feet on a biped (B)** gave the highest bounce and survived the soak, but feet slide badly and it
+   stopped tracking heading; arms alone don't fix the biped.
+5. **Gaits are narrow.** C passes its tuned scenarios but falls often under random speed/heading changes; robustness
+   needs the soak in the tuning objective.
+6. **Looks:** the optimizer only rewarded survival, speed and air time, so the runs are crouched, strongly forward-leaning
+   sprints with large arm swings. Style terms (posture, arm range, bounce height) are the next tuning step.
