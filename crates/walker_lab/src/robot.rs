@@ -145,6 +145,20 @@ pub struct ShapeInfo {
     pub taper: [f32; 2],
 }
 
+/// Corners of a tapered box plus a front apex over the centre of its front face.
+pub fn chest_points(half: [f32; 3], taper: [f32; 2]) -> Vec<Vector> {
+    let [hx, hy, hz] = half;
+    let mut pts = Vec::new();
+    for (y, s) in [(hy, taper[0]), (-hy, taper[1])] {
+        for (sx, sz) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
+            pts.push(Vector::new(sx * hx * s, y, sz * hz * s));
+        }
+    }
+    let front_mid = hz * 0.5 * (taper[0] + taper[1]);
+    pts.push(Vector::new(0.0, 0.0, front_mid + 0.55 * hz));
+    pts
+}
+
 /// Shape style by tag: tapered boxes for the V torso and widening legs, spheres for ball joints.
 pub fn shape_style(tag: &str) -> (&'static str, [f32; 2]) {
     match tag {
@@ -155,7 +169,8 @@ pub fn shape_style(tag: &str) -> (&'static str, [f32; 2]) {
         // Pyramid: base rectangle ±half[0] × ±half[1] at local z = 0, apex at z = half[2].
         "pyramid" => ("pyramid", [1.0, 1.0]),
         "v_groin" => ("box", [1.0, 0.6]),
-        "v_chest" => ("box", [1.0, 0.55]),
+        // Chest: tapered box whose front face rises to a point (pyramid on the front-face corners).
+        "v_chest" => ("chest", [1.0, 0.55]),
         "v_pelvis" => ("box", [1.0, 0.75]),
         "v_thigh" => ("box", [0.8, 1.15]),
         "v_shin" => ("box", [0.85, 1.15]),
@@ -241,6 +256,8 @@ pub(crate) fn add_body(
             ColliderBuilder::cylinder(p.half[1], p.half[0])
         } else if kind == "cyl_x" {
             ColliderBuilder::cylinder(p.half[1], p.half[0]).rotation(Vector::new(0.0, 0.0, std::f32::consts::FRAC_PI_2))
+        } else if kind == "chest" {
+            ColliderBuilder::convex_hull(&chest_points(p.half, taper)).expect("chest hull")
         } else if kind == "pyramid" {
             let [hx, hy, hz] = p.half;
             let pts = [Vector::new(hx, hy, 0.0), Vector::new(-hx, hy, 0.0), Vector::new(hx, -hy, 0.0), Vector::new(-hx, -hy, 0.0), Vector::new(0.0, 0.0, hz)];

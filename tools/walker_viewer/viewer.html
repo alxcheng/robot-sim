@@ -31,6 +31,27 @@ function shapeGeometry(s) {
   if (s.kind === 'ball') return new THREE.SphereGeometry(s.half[0], 20, 14);
   if (s.kind === 'cyl_y') return new THREE.CylinderGeometry(s.half[0], s.half[0], s.half[1] * 2, 20);
   if (s.kind === 'cyl_x') { const g = new THREE.CylinderGeometry(s.half[0], s.half[0], s.half[1] * 2, 20); g.rotateZ(Math.PI / 2); return g; }
+  if (s.kind === 'chest') {
+    // Tapered box whose front face rises to a point over the face centre.
+    const [hx, hy, hz] = s.half, [tt, tb] = s.taper;
+    const c = (sx, y, sz, t) => [sx * hx * t, y, sz * hz * t];
+    const TFL = c(-1, hy, 1, tt), TFR = c(1, hy, 1, tt), TBL = c(-1, hy, -1, tt), TBR = c(1, hy, -1, tt);
+    const BFL = c(-1, -hy, 1, tb), BFR = c(1, -hy, 1, tb), BBL = c(-1, -hy, -1, tb), BBR = c(1, -hy, -1, tb);
+    const P = [0, 0, hz * 0.5 * (tt + tb) + 0.55 * hz];
+    const quad = (a, b, c2, d) => [a, b, c2, a, c2, d];
+    const tris = [
+      ...quad(TBL, TBR, BBR, BBL), // back
+      ...quad(TFL, TFR, TBR, TBL), // top
+      ...quad(BFL, BBL, BBR, BFR), // bottom
+      ...quad(TFR, BFR, BBR, TBR), // right
+      ...quad(TFL, TBL, BBL, BFL), // left
+      P, TFR, TFL, P, BFR, TFR, P, BFL, BFR, P, TFL, BFL, // front pyramid
+    ];
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(tris.flat(), 3));
+    g.computeVertexNormals();
+    return g;
+  }
   if (s.kind === 'pyramid') {
     const [hx, hy, hz] = s.half;
     const A = [hx, hy, 0], B = [-hx, hy, 0], C = [-hx, -hy, 0], D = [hx, -hy, 0], P = [0, 0, hz];
@@ -102,7 +123,7 @@ function init(width, height) {
       const m = new THREE.Mesh(shapeGeometry(s), mat);
       m.position.set(...s.offset); m.castShadow = true; m.receiveShadow = true;
       g.add(m);
-      if (s.kind === 'box' || s.kind === 'pyramid') {
+      if (s.kind === 'box' || s.kind === 'pyramid' || s.kind === 'chest') {
         const edges = new THREE.LineSegments(new THREE.EdgesGeometry(m.geometry), new THREE.LineBasicMaterial({ color: 0x0a0d10 }));
         edges.position.copy(m.position); g.add(edges);
       }
