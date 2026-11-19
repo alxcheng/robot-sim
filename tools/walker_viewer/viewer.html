@@ -23,7 +23,24 @@ let scene, camera, renderer, meshes = [], camPos = null, camTarget = null, arrow
 const COLORS = {
   torso: 0xaab4be, reactor: 0x66727e, waist: 0x5f6a75, plate: 0xc4ccd3, pauldron: 0xb4bec7, head: 0xc4ccd3, arm: 0x8d98a3,
   thigh: 0x8e99a4, shin: 0x8e99a4, meta: 0x7a8591, foot: 0x4b5560, hoof: 0x3a4250, forearm: 0x7f8a95, gimbal: 0x2a323a, wheel: 0x5a6570,
+  v_pelvis: 0x6c7782, v_chest: 0xb8c1c9, v_thigh: 0x7c8792, v_shin: 0xa3adb7, v_meta: 0x95a0aa, v_forearm: 0x9aa4ae,
+  v_pauldron: 0xc2cad1, ball: 0x3c4651, pack: 0x5d6873, armor: 0xaeb8c1, weapon: 0x3a434d,
 };
+function shapeGeometry(s) {
+  if (s.kind === 'ball') return new THREE.SphereGeometry(s.half[0], 20, 14);
+  const geo = new THREE.BoxGeometry(s.half[0] * 2, s.half[1] * 2, s.half[2] * 2);
+  const t = s.taper || [1, 1];
+  if (t[0] !== 1 || t[1] !== 1) {
+    const pos = geo.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const k = pos.getY(i) > 0 ? t[0] : t[1];
+      pos.setX(i, pos.getX(i) * k);
+      pos.setZ(i, pos.getZ(i) * k);
+    }
+    geo.computeVertexNormals();
+  }
+  return geo;
+}
 
 function init(width, height) {
   renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
@@ -36,8 +53,8 @@ function init(width, height) {
   scene.fog = new THREE.Fog(0x11151a, 40, 90);
   camera = new THREE.PerspectiveCamera(42, width / height, 0.1, 200);
 
-  scene.add(new THREE.HemisphereLight(0xdfeaff, 0x2a323a, 1.05));
-  const sun = new THREE.DirectionalLight(0xffffff, 1.15);
+  scene.add(new THREE.HemisphereLight(0xdfeaff, 0x2a323a, 0.8));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.85);
   sun.position.set(-8, 14, -6);
   sun.castShadow = true;
   sun.shadow.mapSize.set(1024, 1024);
@@ -69,12 +86,14 @@ function init(width, height) {
   for (const link of REC.links) {
     const g = new THREE.Group();
     for (const s of link.shapes) {
-      const mat = new THREE.MeshStandardMaterial({ color: COLORS[s.tag] ?? 0x888888, metalness: 0.35, roughness: 0.55 });
-      const m = new THREE.Mesh(new THREE.BoxGeometry(s.half[0] * 2, s.half[1] * 2, s.half[2] * 2), mat);
+      const mat = new THREE.MeshStandardMaterial({ color: COLORS[s.tag] ?? 0x888888, metalness: 0.45, roughness: 0.6 });
+      const m = new THREE.Mesh(shapeGeometry(s), mat);
       m.position.set(...s.offset); m.castShadow = true; m.receiveShadow = true;
       g.add(m);
-      const edges = new THREE.LineSegments(new THREE.EdgesGeometry(m.geometry), new THREE.LineBasicMaterial({ color: 0x0a0d10 }));
-      edges.position.copy(m.position); g.add(edges);
+      if (s.kind !== 'ball') {
+        const edges = new THREE.LineSegments(new THREE.EdgesGeometry(m.geometry), new THREE.LineBasicMaterial({ color: 0x0a0d10 }));
+        edges.position.copy(m.position); g.add(edges);
+      }
       if (s.tag === 'reactor') {
         const glow = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.16, 0.02), new THREE.MeshBasicMaterial({ color: 0x86b3c6 }));
         glow.position.set(s.offset[0], s.offset[1], s.offset[2] + s.half[2] + 0.011); g.add(glow);
@@ -85,11 +104,15 @@ function init(width, height) {
       }
       if (s.tag === 'wheel') {
         const ax = s.half[0] < s.half[2] ? 'x' : 'z';
-        const ring = new THREE.Mesh(new THREE.TorusGeometry(0.36, 0.035, 8, 32), new THREE.MeshBasicMaterial({ color: 0xe3a42c }));
+        const ring = new THREE.Mesh(new THREE.TorusGeometry(Math.max(s.half[0], s.half[2], s.half[1]) * 0.85, 0.03, 8, 32), new THREE.MeshBasicMaterial({ color: 0xe3a42c }));
         if (ax === 'x') ring.rotation.y = Math.PI / 2;
         ring.position.set(...s.offset); g.add(ring);
       }
-      if (s.tag === 'thigh' || s.tag === 'shin' || s.tag === 'meta') {
+      if (s.tag === 'weapon') {
+        const muzzle = new THREE.Mesh(new THREE.BoxGeometry(s.half[0] * 1.2, 0.05, s.half[2] * 1.2), new THREE.MeshBasicMaterial({ color: 0xe3a42c }));
+        muzzle.position.set(s.offset[0], s.offset[1] - s.half[1] - 0.026, s.offset[2]); g.add(muzzle);
+      }
+      if (s.tag === 'thigh' || s.tag === 'shin' || s.tag === 'meta' || s.tag === 'v_shin') {
         const stripe = new THREE.Mesh(new THREE.BoxGeometry(s.half[0] * 1.2, 0.05, 0.02), new THREE.MeshBasicMaterial({ color: 0xe3a42c }));
         stripe.position.set(s.offset[0], s.offset[1] + s.half[1] * 0.5, s.offset[2] + s.half[2] + 0.011); g.add(stripe);
       }
@@ -99,6 +122,7 @@ function init(width, height) {
 }
 
 function show(i) {
+  if (window.CAM) { document.getElementById('hud').style.display = 'none'; document.getElementById('legend').style.display = 'none'; document.getElementById('label').style.display = 'none'; }
   const f = REC.frames[i];
   f.b.forEach((p, k) => {
     meshes[k].position.set(p[0], p[1], p[2]);
@@ -106,12 +130,13 @@ function show(i) {
   });
   const trunk = f.b[0];
   const target = new THREE.Vector3(trunk[0], 1.6, trunk[2]);
-  const off = window.CAM === 'front' ? new THREE.Vector3(0.0, 0.5, 9.5) : window.CAM === 'side' ? new THREE.Vector3(9.5, 0.4, 0.0) : new THREE.Vector3(7.0, 2.4, 5.5);
+  const off = window.CAM === 'front' ? new THREE.Vector3(0.0, 0.5, 9.5) : window.CAM === 'side' ? new THREE.Vector3(9.5, 0.4, 0.0)
+    : window.CAM === 'back' ? new THREE.Vector3(-5.0, 1.6, -7.5) : new THREE.Vector3(7.0, 2.4, 5.5);
   const desired = target.clone().add(off);
   if (!camPos) { camPos = desired.clone(); camTarget = target.clone(); }
   camPos.lerp(desired, 0.08); camTarget.lerp(target, 0.12);
   camera.position.copy(camPos); camera.lookAt(camTarget);
-  sun.position.set(target.x + 6, 14, target.z + 8); sun.target.position.copy(target);
+  sun.position.set(target.x - 6, 14, target.z + 6); sun.target.position.copy(target);
 
   // Push arrow for 0.6 s after each push.
   if (arrow) { scene.remove(arrow); arrow = null; }

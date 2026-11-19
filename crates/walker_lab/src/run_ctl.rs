@@ -407,18 +407,22 @@ pub fn apply_action(w: &mut PhysicsWorld, r: &Robot, a: &Action, kd: f32) {
             } else {
                 leg.joints[SLOT_JOINT[k]]
             };
-            set_motor(w, jh, SLOT_JOINT[k], a.legs[i][k], &JointGains { kp: a.kp[i][k], kd });
+            set_motor_s(w, jh, SLOT_JOINT[k], a.legs[i][k], &JointGains { kp: a.kp[i][k], kd }, r.motor_scale);
         }
     }
     if let Some(arms) = &r.arms {
         let g = JointGains { kp: 1.0, kd: 0.08 };
+        let s = r.motor_scale;
         for (i, arm) in arms.iter().enumerate() {
-            set_motor(w, arm.pitch.0, ARM, a.arms[i][0], &g);
+            set_motor_s(w, arm.pitch.0, ARM, a.arms[i][0], &g, s);
             if let Some(jr) = arm.roll {
-                set_motor(w, jr, ARM, a.arms[i][1], &g);
+                set_motor_s(w, jr, ARM, a.arms[i][1], &g, s);
+            }
+            if let Some(jy) = arm.yaw {
+                set_motor_s(w, jy, ARM, 0.0, &g, s);
             }
             if let Some((je, _)) = arm.elbow {
-                set_motor(w, je, ARM, a.arms[i][2], &JointGains { kp: 0.6, kd: 0.08 });
+                set_motor_s(w, je, ARM, a.arms[i][2], &JointGains { kp: 0.6, kd: 0.08 }, s);
             }
         }
     }
@@ -427,6 +431,10 @@ pub fn apply_action(w: &mut PhysicsWorld, r: &Robot, a: &Action, kd: f32) {
 /// Low-level reflexes kept outside any learned policy: reaction wheels (internal torque) and the
 /// optional external upright assist.
 pub fn reflexes(w: &mut PhysicsWorld, r: &Robot, wheel_k: f32, assist: f32, lean_des: f32) {
+    // Waist: yaw-only; held facing forward (later: aim direction).
+    if let Some((wj, _)) = r.waist {
+        set_motor_s(w, wj, WAIST, 0.0, &JointGains { kp: 1.0, kd: 0.1 }, r.motor_scale);
+    }
     let trunk_rot = *w.bodies[r.trunk].rotation();
     let yaw = yaw_of(&trunk_rot);
     let inv_h = Rotation::from_rotation_y(-yaw);

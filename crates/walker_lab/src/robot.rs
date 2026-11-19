@@ -18,6 +18,7 @@ pub const ANKLE_PITCH: usize = 4; // foot pitch joint (ankle on biped, toe on di
 pub const ANKLE_ROLL: usize = 5;
 pub const META: usize = 6; // digitigrade metatarsal joint
 pub const ARM: usize = 7;
+pub const WAIST: usize = 8;
 
 // Body slots within a leg.
 pub const B_YAW_GIMBAL: usize = 0;
@@ -32,8 +33,8 @@ pub const HIP_X: f32 = 0.38;
 pub const TRUNK_Y: f32 = 2.75;
 
 /// Base position-motor stiffness (N·m/rad) and torque caps, indexed by the joint constants.
-pub const BASE_KP: [f32; 8] = [40_000.0, 150_000.0, 150_000.0, 180_000.0, 120_000.0, 90_000.0, 180_000.0, 40_000.0];
-pub const MAX_TORQUE: [f32; 8] = [20_000.0, 60_000.0, 80_000.0, 80_000.0, 40_000.0, 30_000.0, 80_000.0, 20_000.0];
+pub const BASE_KP: [f32; 9] = [40_000.0, 150_000.0, 150_000.0, 180_000.0, 120_000.0, 90_000.0, 180_000.0, 40_000.0, 80_000.0];
+pub const MAX_TORQUE: [f32; 9] = [20_000.0, 60_000.0, 80_000.0, 80_000.0, 40_000.0, 30_000.0, 80_000.0, 20_000.0, 30_000.0];
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub enum LegKind {
@@ -56,6 +57,25 @@ pub struct RobotSpec {
     /// Body proportions.
     #[serde(default)]
     pub frame: Frame,
+    /// Swappable attachment load (mech-V frame only).
+    #[serde(default)]
+    pub load: Load,
+    /// Leg/arm actuator strength relative to "sized for this body weight" (mech-V frame only).
+    #[serde(default = "one_f")]
+    pub strength: f32,
+}
+
+fn one_f() -> f32 {
+    1.0
+}
+
+/// Attachment loads for swap tests: weapons, back units and armor carried by the upper body.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub enum Load {
+    #[default]
+    Light,
+    Medium,
+    Heavy,
 }
 
 /// `Classic`: the original boxy core. `Mech`: broad shoulders with large shoulder armor, compact chest over a narrow
@@ -65,6 +85,8 @@ pub enum Frame {
     #[default]
     Classic,
     Mech,
+    /// Slim yaw-only waist, V-shaped torso, ball shoulders and hips, legs widening to large feet.
+    MechV,
 }
 
 fn one() -> u8 {
@@ -73,7 +95,7 @@ fn one() -> u8 {
 
 impl Default for RobotSpec {
     fn default() -> Self {
-        RobotSpec { legs: LegKind::Biped, foot_scale: 1.0, swing_arms: false, reaction_wheels: false, arm_dof: 1, frame: Frame::Classic }
+        RobotSpec { legs: LegKind::Biped, foot_scale: 1.0, swing_arms: false, reaction_wheels: false, arm_dof: 1, frame: Frame::Classic, load: Load::Light, strength: 1.0 }
     }
 }
 
@@ -83,12 +105,16 @@ impl RobotSpec {
         match self.frame {
             Frame::Classic => (HIP_X, HIP_Y, TRUNK_Y),
             Frame::Mech => (0.34, 2.05, 2.70),
+            Frame::MechV => (0.30, 2.05, 2.15),
         }
     }
     /// Segment lengths from hip to the foot gimbal (virtual leg), and gimbal height above the ground.
     pub fn segments(&self) -> ([f32; 3], f32) {
         if self.frame == Frame::Mech && self.legs == LegKind::Deer {
             return ([0.52, 0.74, 0.67], 0.12);
+        }
+        if self.frame == Frame::MechV {
+            return ([0.50, 0.74, 0.65], 0.16);
         }
         match self.legs {
             LegKind::Biped => ([0.9, 0.88, 0.0], 0.22),
@@ -113,6 +139,25 @@ pub struct ShapeInfo {
     pub half: [f32; 3],
     pub offset: [f32; 3],
     pub tag: &'static str,
+    /// "box" or "ball"
+    pub kind: &'static str,
+    /// Size scale of the box's top and bottom faces (x and z), for tapered parts.
+    pub taper: [f32; 2],
+}
+
+/// Shape style by tag: tapered boxes for the V torso and widening legs, spheres for ball joints.
+pub fn shape_style(tag: &str) -> (&'static str, [f32; 2]) {
+    match tag {
+        "ball" => ("ball", [1.0, 1.0]),
+        "v_chest" => ("box", [1.0, 0.55]),
+        "v_pelvis" => ("box", [1.0, 0.75]),
+        "v_thigh" => ("box", [0.8, 1.15]),
+        "v_shin" => ("box", [0.85, 1.15]),
+        "v_meta" => ("box", [0.9, 1.2]),
+        "v_forearm" => ("box", [0.9, 1.2]),
+        "v_pauldron" => ("box", [1.0, 0.8]),
+        _ => ("box", [1.0, 1.0]),
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -144,6 +189,8 @@ pub struct Arm {
     /// Shoulder pitch joint and the upper-arm body (the whole arm when arm_dof = 1).
     pub pitch: (MultibodyJointHandle, RigidBodyHandle),
     pub roll: Option<MultibodyJointHandle>,
+    /// Upper-arm twist (third axis of a ball shoulder).
+    pub yaw: Option<MultibodyJointHandle>,
     pub elbow: Option<(MultibodyJointHandle, RigidBodyHandle)>,
 }
 
@@ -155,16 +202,20 @@ pub struct Robot {
     pub wheels: Vec<Wheel>,
     pub links: Vec<LinkInfo>,
     pub total_mass: f32,
+    /// Yaw-only waist joint and the upper-body link (mech-V frame).
+    pub waist: Option<(MultibodyJointHandle, RigidBodyHandle)>,
+    /// Multiplies every motor's stiffness and torque cap.
+    pub motor_scale: f32,
 }
 
-struct Part {
-    half: [f32; 3],
-    offset: [f32; 3],
-    mass: f32,
-    tag: &'static str,
+pub(crate) struct Part {
+    pub half: [f32; 3],
+    pub offset: [f32; 3],
+    pub mass: f32,
+    pub tag: &'static str,
 }
 
-fn add_body(
+pub(crate) fn add_body(
     w: &mut PhysicsWorld,
     links: &mut Vec<LinkInfo>,
     name: String,
@@ -177,13 +228,28 @@ fn add_body(
     let mut shapes = Vec::new();
     for p in parts {
         let groups = if collide { robot_groups() } else { no_contact_groups() };
-        let c = ColliderBuilder::cuboid(p.half[0], p.half[1], p.half[2])
+        let (kind, taper) = shape_style(p.tag);
+        let base = if kind == "ball" {
+            ColliderBuilder::ball(p.half[0])
+        } else if taper != [1.0, 1.0] {
+            let [hx, hy, hz] = p.half;
+            let mut pts = Vec::new();
+            for (y, s) in [(hy, taper[0]), (-hy, taper[1])] {
+                for (sx, sz) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
+                    pts.push(Vector::new(sx * hx * s, y, sz * hz * s));
+                }
+            }
+            ColliderBuilder::convex_hull(&pts).expect("tapered hull")
+        } else {
+            ColliderBuilder::cuboid(p.half[0], p.half[1], p.half[2])
+        };
+        let c = base
             .translation(Vector::new(p.offset[0], p.offset[1], p.offset[2]))
             .mass(p.mass)
             .friction(1.0)
             .collision_groups(groups);
         cols.push(w.insert_collider(c, Some(body)));
-        shapes.push(ShapeInfo { half: p.half, offset: p.offset, tag: p.tag });
+        shapes.push(ShapeInfo { half: p.half, offset: p.offset, tag: p.tag, kind, taper });
     }
     links.push(LinkInfo { name, body, shapes });
     (body, cols)
@@ -195,7 +261,7 @@ pub struct JointGains {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn revolute(
+pub(crate) fn revolute(
     w: &mut PhysicsWorld,
     parent: RigidBodyHandle,
     child: RigidBodyHandle,
@@ -219,6 +285,9 @@ fn revolute(
 }
 
 pub fn build(w: &mut PhysicsWorld, origin: Vector, spec: RobotSpec) -> Robot {
+    if spec.frame == Frame::MechV {
+        return crate::robot_v::build_v(w, origin, spec);
+    }
     let mut links = Vec::new();
     let o = origin;
     let mech = spec.frame == Frame::Mech;
@@ -326,7 +395,7 @@ pub fn build(w: &mut PhysicsWorld, origin: Vector, spec: RobotSpec) -> Robot {
                 let (a, _) = add_body(w, links, format!("{n}_arm"), trunk_pos + Vector::new(side * 0.82, 0.12, 0.0),
                     &[Part { half: [0.15, 0.58, 0.18], offset: [0.0; 3], mass: 150.0, tag: "arm" }], true);
                 let j = revolute(w, trunk, a, Vector::X, shoulder_local, Vector::new(0.0, 0.5, 0.0), Some([-1.2, 1.2]), MAX_TORQUE[ARM]);
-                return Arm { pitch: (j, a), roll: None, elbow: None };
+                return Arm { pitch: (j, a), roll: None, yaw: None, elbow: None };
             }
             // Shoulder roll (Z) -> shoulder pitch (X) -> elbow (X).
             let (g, _) = add_body(w, links, format!("{n}_shoulder"), shoulder,
@@ -348,7 +417,7 @@ pub fn build(w: &mut PhysicsWorld, origin: Vector, spec: RobotSpec) -> Robot {
             let fore = if mech { Part { half: [0.19, hf, 0.21], offset: [0.0; 3], mass: 70.0, tag: "forearm" } } else { Part { half: [0.13, hf, 0.15], offset: [0.0; 3], mass: 60.0, tag: "forearm" } };
             let (fa, _) = add_body(w, links, format!("{n}_forearm"), shoulder - Vector::new(0.0, 2.0 * hu + hf, 0.0), &[fore], true);
             let je = revolute(w, ua, fa, Vector::X, Vector::new(0.0, -hu, 0.0), Vector::new(0.0, hf, 0.0), Some([-2.2, 0.05]), MAX_TORQUE[ARM]);
-            Arm { pitch: (jp, ua), roll: Some(jr), elbow: Some((je, fa)) }
+            Arm { pitch: (jp, ua), roll: Some(jr), yaw: None, elbow: Some((je, fa)) }
         };
         [mk_arm(w, &mut links, 1.0), mk_arm(w, &mut links, -1.0)]
     });
@@ -377,19 +446,24 @@ pub fn build(w: &mut PhysicsWorld, origin: Vector, spec: RobotSpec) -> Robot {
     }
 
     let total_mass = links.iter().map(|l| w.bodies[l.body].mass()).sum();
-    Robot { spec, trunk, legs: [left, right], arms, wheels, links, total_mass }
+    Robot { spec, trunk, legs: [left, right], arms, wheels, links, total_mass, waist: None, motor_scale: 1.0 }
 }
 
 /// Update one joint's position motor. `g.kp` scales the joint's base stiffness; `g.kd` is damping
 /// as a fraction of stiffness (s).
 pub fn set_motor(w: &mut PhysicsWorld, j: MultibodyJointHandle, k: usize, target: f32, g: &JointGains) {
-    let kp = BASE_KP[k] * g.kp;
+    set_motor_s(w, j, k, target, g, 1.0)
+}
+
+/// As `set_motor`, with stiffness and torque cap multiplied by `scale` (robot motor strength).
+pub fn set_motor_s(w: &mut PhysicsWorld, j: MultibodyJointHandle, k: usize, target: f32, g: &JointGains, scale: f32) {
+    let kp = BASE_KP[k] * g.kp * scale;
     let kd = kp * g.kd;
     if let Some((mb, id)) = w.multibody_joints.get_mut(j) {
         if let Some(link) = mb.link_mut(id) {
             link.joint.data.set_motor_model(JointAxis::AngX, MotorModel::ForceBased);
             link.joint.data.set_motor(JointAxis::AngX, target, 0.0, kp, kd);
-            link.joint.data.set_motor_max_force(JointAxis::AngX, MAX_TORQUE[k] * torque_scale());
+            link.joint.data.set_motor_max_force(JointAxis::AngX, MAX_TORQUE[k] * torque_scale() * scale);
         }
     }
 }

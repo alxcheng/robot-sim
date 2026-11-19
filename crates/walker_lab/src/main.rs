@@ -11,6 +11,7 @@ mod controller;
 mod policy;
 mod ppo;
 mod robot;
+mod robot_v;
 mod run_ctl;
 mod sim;
 
@@ -207,9 +208,15 @@ fn build_spec(name: &str) -> robot::RobotSpec {
         "C" => RobotSpec { legs: LegKind::Digitigrade, foot_scale: 1.3, swing_arms: true, reaction_wheels: false, ..Default::default() },
         "D" => RobotSpec { legs: LegKind::Digitigrade, foot_scale: 1.3, swing_arms: true, reaction_wheels: true, ..Default::default() },
         // Deer legs on hooves, 3-joint arms, reaction wheels.
-        "E" => RobotSpec { legs: LegKind::Deer, foot_scale: 1.0, swing_arms: true, reaction_wheels: true, arm_dof: 3, frame: Default::default() },
+        "E" => RobotSpec { legs: LegKind::Deer, foot_scale: 1.0, swing_arms: true, reaction_wheels: true, arm_dof: 3, ..Default::default() },
         // E on the mech-proportioned frame.
-        "F" => RobotSpec { legs: LegKind::Deer, foot_scale: 1.0, swing_arms: true, reaction_wheels: true, arm_dof: 3, frame: robot::Frame::Mech },
+        "F" => RobotSpec { legs: LegKind::Deer, foot_scale: 1.0, swing_arms: true, reaction_wheels: true, arm_dof: 3, frame: robot::Frame::Mech, ..Default::default() },
+        // Mech-V frame with swappable loads; strong legs (1.3× motors for its weight), light top.
+        "GL" | "GM" | "GH" => RobotSpec {
+            legs: LegKind::Deer, foot_scale: 1.0, swing_arms: true, reaction_wheels: true, arm_dof: 3,
+            frame: robot::Frame::MechV, strength: 1.3,
+            load: match name { "GL" => robot::Load::Light, "GM" => robot::Load::Medium, _ => robot::Load::Heavy },
+        },
         _ => panic!("unknown build {name}"),
     }
 }
@@ -584,6 +591,58 @@ fn ppo_train(build: &str, iters: usize, init: &str) {
     }
 }
 
+/// Render a standing pose for look approval: pelvis pinned, joints driven to a stand pose,
+/// optional waist twist; the frame is shifted so the feet sit on the ground.
+fn pose(build: &str, out: &str, twist: f32) {
+    use rapier3d::prelude::*;
+    let spec = build_spec(build);
+    let mut w = PhysicsWorld::new();
+    w.integration_parameters.dt = sim::DT;
+    w.integration_parameters.num_solver_iterations = sim::SUBSTEPS;
+    w.gravity = Vector::ZERO;
+    let r = robot::build(&mut w, Vector::ZERO, spec);
+    w.bodies[r.trunk].set_body_type(RigidBodyType::Fixed, true);
+    let lmax = run_ctl::max_leg_len(&spec);
+    let (qk, qm, p0) = run_ctl::leg_ik(&spec, 0.90 * lmax, 1.0);
+    let g = robot::JointGains { kp: 1.0, kd: 0.2 };
+    for _ in 0..240 {
+        for leg in &r.legs {
+            robot::set_motor(&mut w, leg.joints[robot::HIP_PITCH], robot::HIP_PITCH, -p0, &g);
+            robot::set_motor(&mut w, leg.joints[robot::KNEE], robot::KNEE, qk, &g);
+            if let Some((jm, _)) = leg.meta {
+                robot::set_motor(&mut w, jm, robot::META, qm, &g);
+            }
+            robot::set_motor(&mut w, leg.joints[robot::ANKLE_PITCH], robot::ANKLE_PITCH, -(-p0 + qk + qm), &g);
+            robot::set_motor(&mut w, leg.joints[robot::HIP_ROLL], robot::HIP_ROLL, leg.side * 0.04, &g);
+        }
+        if let Some(arms) = &r.arms {
+            for (i, arm) in arms.iter().enumerate() {
+                let side = r.legs[i].side;
+                robot::set_motor(&mut w, arm.pitch.0, robot::ARM, -0.15, &g);
+                if let Some(jr) = arm.roll { robot::set_motor(&mut w, jr, robot::ARM, side * 0.18, &g); }
+                if let Some((je, _)) = arm.elbow { robot::set_motor(&mut w, je, robot::ARM, -0.45, &g); }
+            }
+        }
+        if let Some((wj, _)) = r.waist {
+            robot::set_motor(&mut w, wj, robot::WAIST, twist, &g);
+        }
+        w.step();
+    }
+    // Shift so the lowest foot touches y = 0.
+    let min_y = r.legs.iter().map(|l| w.bodies[l.bodies[robot::B_FOOT]].translation().y - 0.08).fold(f32::MAX, f32::min);
+    let b: Vec<[f32; 7]> = r.links.iter().map(|l| {
+        let body = &w.bodies[l.body];
+        let (p, q) = (body.translation(), body.rotation());
+        [p.x, p.y - min_y, p.z, q.x, q.y, q.z, q.w]
+    }).collect();
+    let top = r.links.iter().flat_map(|l| { let body = &w.bodies[l.body]; l.shapes.iter().map(move |s| body.translation().y + s.offset[1] + s.half[1]) }).fold(f32::MIN, f32::max) - min_y;
+    let hip = w.bodies[r.legs[0].bodies[robot::B_YAW_GIMBAL]].translation().y - min_y;
+    println!("{build}: mass {:.0} kg, motor scale {:.2}, standing height ~{:.2} m, hip {:.2} m ({:.0}% of height)", r.total_mass, r.motor_scale, top, hip, 100.0 * hip / top);
+    let rec = serde_json::json!({ "scenario": format!("BUILD {build} · look check"), "assist": 0.0, "dt": sim::DT, "links": r.links, "platform": null,
+        "pushes": [], "frames": [{ "t": 0.0, "b": b, "speed": 0.0, "cmd_speed": 0.0, "heading": 0.0, "cmd_heading": 0.0, "label": "", "feet": 2, "toe": [0.0, 0.0], "contact": [true, true] }] });
+    fs::write(out, serde_json::to_string(&rec).unwrap()).unwrap();
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let a = |i: usize| args.get(i).cloned();
@@ -608,6 +667,7 @@ fn main() {
         Some("diag") => diag(),
         Some("runreport") => run_report(),
         Some("evaldistill") => eval_distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
+        Some("pose") => pose(&a(2).unwrap(), &a(3).unwrap(), a(4).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
         Some("ppo") => ppo_train(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(100), &a(4).unwrap()),
         Some("distill") => distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0), a(4).map(|s| s.parse().unwrap()).unwrap_or(5)),
         Some("runtune") => run_tune(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(100), a(4).map(|s| s.parse().unwrap()).unwrap_or(0.35)),
