@@ -1,0 +1,133 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; background: #11151a; overflow: hidden; font-family: "DejaVu Sans Mono", monospace; }
+  #hud { position: absolute; left: 18px; top: 14px; color: #dde3e8; font-size: 15px; line-height: 1.5; text-shadow: 0 1px 2px #000; }
+  #hud .title { font-size: 13px; letter-spacing: .14em; color: #86b3c6; }
+  #hud b { color: #e3a42c; font-weight: normal; }
+  #label { position: absolute; right: 22px; top: 16px; color: #e3a42c; font-size: 26px; letter-spacing: .08em; text-shadow: 0 1px 3px #000; }
+  #label.fall { color: #ec6f55; }
+  #legend { position: absolute; left: 18px; bottom: 12px; color: #8692a0; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="hud"></div>
+<div id="label"></div>
+<div id="legend">walker_lab · Rapier 0.36 multibody · 60 Hz × 4 substeps · SIMBICON-style controller</div>
+<script>
+// Expects window.REC (recording JSON) and THREE to be injected before init() is called.
+let scene, camera, renderer, meshes = [], camPos = null, camTarget = null, arrow = null;
+
+const COLORS = {
+  torso: 0xaab4be, reactor: 0x66727e, head: 0xc4ccd3, arm: 0x8d98a3,
+  thigh: 0x8e99a4, shin: 0x8e99a4, foot: 0x4b5560, gimbal: 0x2a323a,
+};
+
+function init(width, height) {
+  renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+  renderer.setSize(width, height);
+  renderer.setPixelRatio(1);
+  renderer.shadowMap.enabled = true;
+  document.body.appendChild(renderer.domElement);
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x11151a);
+  scene.fog = new THREE.Fog(0x11151a, 40, 90);
+  camera = new THREE.PerspectiveCamera(42, width / height, 0.1, 200);
+
+  scene.add(new THREE.HemisphereLight(0xdfeaff, 0x2a323a, 1.05));
+  const sun = new THREE.DirectionalLight(0xffffff, 1.15);
+  sun.position.set(-8, 14, -6);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(1024, 1024);
+  const sc = sun.shadow.camera; sc.left = -8; sc.right = 8; sc.top = 8; sc.bottom = -8; sc.near = 1; sc.far = 40;
+  scene.add(sun); scene.add(sun.target);
+  window.sun = sun;
+
+  // Floor: 1 m tiles with a brighter line every 5 m, so speed reads clearly.
+  const cv = document.createElement('canvas'); cv.width = cv.height = 512;
+  const cx = cv.getContext('2d');
+  cx.fillStyle = '#252d36'; cx.fillRect(0, 0, 512, 512);
+  cx.strokeStyle = '#34404c'; cx.lineWidth = 2;
+  for (let i = 0; i <= 5; i++) { const p = i * 512 / 5; cx.beginPath(); cx.moveTo(p, 0); cx.lineTo(p, 512); cx.moveTo(0, p); cx.lineTo(512, p); cx.stroke(); }
+  cx.strokeStyle = '#55697d'; cx.lineWidth = 5; cx.strokeRect(0, 0, 512, 512);
+  const tex = new THREE.CanvasTexture(cv); tex.wrapS = tex.wrapT = THREE.RepeatWrapping; tex.repeat.set(80, 80);
+  tex.anisotropy = 8;
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.95 }));
+  ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; scene.add(ground);
+
+  if (REC.platform) {
+    const [h, zEnd] = REC.platform, z0 = -8;
+    const plat = new THREE.Mesh(new THREE.BoxGeometry(8, h, zEnd - z0),
+      new THREE.MeshStandardMaterial({ color: 0x3a4652, roughness: 0.8 }));
+    plat.position.set(0, h / 2, (zEnd + z0) / 2); plat.receiveShadow = true; plat.castShadow = true; scene.add(plat);
+    const edge = new THREE.Mesh(new THREE.BoxGeometry(8, 0.02, 0.12), new THREE.MeshBasicMaterial({ color: 0xe3a42c }));
+    edge.position.set(0, h + 0.011, zEnd - 0.06); scene.add(edge);
+  }
+
+  for (const link of REC.links) {
+    const g = new THREE.Group();
+    for (const s of link.shapes) {
+      const mat = new THREE.MeshStandardMaterial({ color: COLORS[s.tag] ?? 0x888888, metalness: 0.35, roughness: 0.55 });
+      const m = new THREE.Mesh(new THREE.BoxGeometry(s.half[0] * 2, s.half[1] * 2, s.half[2] * 2), mat);
+      m.position.set(...s.offset); m.castShadow = true; m.receiveShadow = true;
+      g.add(m);
+      const edges = new THREE.LineSegments(new THREE.EdgesGeometry(m.geometry), new THREE.LineBasicMaterial({ color: 0x0a0d10 }));
+      edges.position.copy(m.position); g.add(edges);
+      if (s.tag === 'reactor') {
+        const glow = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.16, 0.02), new THREE.MeshBasicMaterial({ color: 0x86b3c6 }));
+        glow.position.set(s.offset[0], s.offset[1], s.offset[2] + s.half[2] + 0.011); g.add(glow);
+      }
+      if (s.tag === 'head') {
+        const visor = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.06, 0.02), new THREE.MeshBasicMaterial({ color: 0xe3a42c }));
+        visor.position.set(s.offset[0], s.offset[1] + 0.02, s.offset[2] + s.half[2] + 0.011); g.add(visor);
+      }
+      if (s.tag === 'thigh' || s.tag === 'shin') {
+        const stripe = new THREE.Mesh(new THREE.BoxGeometry(s.half[0] * 1.2, 0.05, 0.02), new THREE.MeshBasicMaterial({ color: 0xe3a42c }));
+        stripe.position.set(s.offset[0], s.offset[1] + s.half[1] * 0.5, s.offset[2] + s.half[2] + 0.011); g.add(stripe);
+      }
+    }
+    scene.add(g); meshes.push(g);
+  }
+}
+
+function show(i) {
+  const f = REC.frames[i];
+  f.b.forEach((p, k) => {
+    meshes[k].position.set(p[0], p[1], p[2]);
+    meshes[k].quaternion.set(p[3], p[4], p[5], p[6]);
+  });
+  const trunk = f.b[0];
+  const target = new THREE.Vector3(trunk[0], 1.6, trunk[2]);
+  const desired = target.clone().add(new THREE.Vector3(7.0, 2.4, 5.5));
+  if (!camPos) { camPos = desired.clone(); camTarget = target.clone(); }
+  camPos.lerp(desired, 0.08); camTarget.lerp(target, 0.12);
+  camera.position.copy(camPos); camera.lookAt(camTarget);
+  sun.position.set(target.x + 6, 14, target.z + 8); sun.target.position.copy(target);
+
+  // Push arrow for 0.6 s after each push.
+  if (arrow) { scene.remove(arrow); arrow = null; }
+  for (const p of REC.pushes) {
+    if (f.t >= p.t && f.t < p.t + 0.6) {
+      const yaw = f.heading;
+      const dir = new THREE.Vector3(p.dv_left * Math.cos(yaw) + p.dv_fwd * Math.sin(yaw), 0, -p.dv_left * Math.sin(yaw) + p.dv_fwd * Math.cos(yaw)).normalize();
+      const origin = new THREE.Vector3(trunk[0], trunk[1], trunk[2]).sub(dir.clone().multiplyScalar(2.4));
+      arrow = new THREE.ArrowHelper(dir, origin, 1.8, 0xe3a42c, 0.5, 0.35); scene.add(arrow);
+    }
+  }
+
+  const assist = REC.assist > 0 ? `ON (×${REC.assist})` : 'OFF — pure physics';
+  document.getElementById('hud').innerHTML =
+    `<div class="title">${REC.scenario.toUpperCase()}</div>` +
+    `t ${f.t.toFixed(1).padStart(5)} s<br>` +
+    `speed <b>${f.speed.toFixed(2)}</b> / cmd ${f.cmd_speed.toFixed(2)} m/s<br>` +
+    `heading ${(f.heading * 57.3).toFixed(0)}° / cmd ${(f.cmd_heading * 57.3).toFixed(0)}°<br>` +
+    `upright assist ${assist}`;
+  const lab = document.getElementById('label');
+  lab.textContent = f.label; lab.className = f.label === 'FALL' ? 'fall' : '';
+  renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
