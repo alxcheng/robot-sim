@@ -91,7 +91,7 @@ pub struct Recording {
     pub frames: Vec<Frame>,
 }
 
-fn build_world(sc: &Scenario) -> (PhysicsWorld, Robot) {
+pub fn build_world(sc: &Scenario) -> (PhysicsWorld, Robot) {
     let mut w = PhysicsWorld::new();
     w.integration_parameters.dt = DT;
     w.integration_parameters.num_solver_iterations = SUBSTEPS;
@@ -119,7 +119,7 @@ fn build_world(sc: &Scenario) -> (PhysicsWorld, Robot) {
     (w, r)
 }
 
-fn command_at(sc: &Scenario, t: f32) -> Command {
+pub fn command_at(sc: &Scenario, t: f32) -> Command {
     let mut cur = Command::default();
     let mut prev = Command::default();
     let mut t0 = 0.0;

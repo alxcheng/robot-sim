@@ -254,6 +254,66 @@ impl Mlp {
         (g, loss)
     }
 
+    pub fn zero_grads(&self) -> Vec<Vec<f32>> {
+        self.layers.iter().flat_map(|l| [vec![0.0; l.w.len()], vec![0.0; l.b.len()]]).collect()
+    }
+
+    /// Normalised network output (before de-normalisation).
+    pub fn forward_norm(&self, x: &[f32]) -> Vec<f32> {
+        self.forward_acts(x).pop().unwrap()
+    }
+
+    /// Accumulate parameter gradients for an arbitrary loss given dL/d(normalised output).
+    pub fn backprop(&self, x: &[f32], dout: &[f32], g: &mut [Vec<f32>]) {
+        let acts = self.forward_acts(x);
+        let mut delta = dout.to_vec();
+        for li in (0..self.layers.len()).rev() {
+            let l = &self.layers[li];
+            let a = &acts[li];
+            let (gw, rest) = g.split_at_mut(2 * li + 1);
+            let gw = &mut gw[2 * li];
+            let gb = &mut rest[0];
+            let mut prev = vec![0.0f32; l.n_in];
+            for o in 0..l.n_out {
+                let d = delta[o];
+                if d == 0.0 {
+                    continue;
+                }
+                gb[o] += d;
+                let row = o * l.n_in;
+                for i in 0..l.n_in {
+                    gw[row + i] += d * a[i];
+                    prev[i] += l.w[row + i] * d;
+                }
+            }
+            if li > 0 {
+                for i in 0..l.n_in {
+                    prev[i] *= 1.0 - a[i] * a[i];
+                }
+            }
+            delta = prev;
+        }
+    }
+
+    /// Adam step with pre-summed gradients divided by `n`.
+    pub fn apply_adam(&mut self, opt: &mut Adam, g: &[Vec<f32>], n: f32, lr: f32) {
+        opt.t += 1;
+        let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
+        let c1 = 1.0 - b1.powi(opt.t);
+        let c2 = 1.0 - b2.powi(opt.t);
+        for (pi, li) in (0..self.layers.len()).flat_map(|l| [(2 * l, l), (2 * l + 1, l)]) {
+            let params = if pi % 2 == 0 { &mut self.layers[li].w } else { &mut self.layers[li].b };
+            for k in 0..params.len() {
+                let gk = g[pi][k] / n;
+                let m = &mut opt.m[pi][k];
+                let v = &mut opt.v[pi][k];
+                *m = b1 * *m + (1.0 - b1) * gk;
+                *v = b2 * *v + (1.0 - b2) * gk * gk;
+                params[k] -= lr * (*m / c1) / ((*v / c2).sqrt() + eps);
+            }
+        }
+    }
+
     pub fn adam(&self) -> Adam {
         let z: Vec<Vec<f32>> = self.layers.iter().flat_map(|l| [vec![0.0; l.w.len()], vec![0.0; l.b.len()]]).collect();
         Adam { m: z.clone(), v: z, t: 0 }

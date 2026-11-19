@@ -9,6 +9,7 @@
 
 mod controller;
 mod policy;
+mod ppo;
 mod robot;
 mod run_ctl;
 mod sim;
@@ -430,7 +431,7 @@ fn eval_student(build: &str, assist: f32, g: run_ctl::RunGait, net: std::sync::A
 
 fn distill(build: &str, assist: f32, iters: usize) {
     let g = load_run_gait(build, assist);
-    fs::create_dir_all("out/distill").ok();
+    fs::create_dir_all(format!("out/distill_{build}")).ok();
     // Teacher clip for reference.
     {
         let mut sc = scenario("run_show", assist);
@@ -440,7 +441,7 @@ fn distill(build: &str, assist: f32, iters: usize) {
         let (_, rec) = run_with(&sc, &move || Box::new(run_ctl::RunController::new(g, assist)) as Box<dyn controller::Ctl>);
         let mut rec = rec.unwrap();
         rec.frames.retain(|f| f.t >= 7.0 && f.t <= 13.0);
-        fs::write("out/distill/clip_teacher.json", serde_json::to_string(&rec).unwrap()).unwrap();
+        fs::write(format!("out/distill_{build}/clip_teacher.json"), serde_json::to_string(&rec).unwrap()).unwrap();
     }
     let (mut data, teacher_surv) = collect(build, assist, g, None, 24, 1000);
     println!("teacher data: {} samples, mean survival {:.1}/20 s", data.len(), teacher_surv);
@@ -464,12 +465,12 @@ fn distill(build: &str, assist: f32, iters: usize) {
         let train_s = t0.elapsed().as_secs_f32();
         let arc = std::sync::Arc::new(net.clone());
         let m = eval_student(build, assist, g, arc.clone(), &format!("STUDENT · DAgger round {it}"),
-            Some((&format!("out/distill/clip_round{it}.json"), 6.0)));
+            Some((&format!("out/distill_{build}/clip_round{it}.json"), 6.0)));
         println!("round {it}: {} samples, loss {:.4}, train {:.0}s | run_show: survived {:.1}/22 s, speed {:.2}, airborne {:.2}",
             data.len(), loss, train_s, m.sim_seconds, m.mean_speed, m.flight_fraction);
         log.push(serde_json::json!({"round": it, "samples": data.len(), "loss": loss, "eval": m}));
-        fs::write(format!("out/distill/net_round{it}.json"), serde_json::to_string(&net).unwrap()).unwrap();
-        fs::write("out/distill/log.json", serde_json::to_string_pretty(&log).unwrap()).unwrap();
+        fs::write(format!("out/distill_{build}/net_round{it}.json"), serde_json::to_string(&net).unwrap()).unwrap();
+        fs::write(format!("out/distill_{build}/log.json"), serde_json::to_string_pretty(&log).unwrap()).unwrap();
         if it < iters {
             let (more, surv) = collect(build, assist, g, Some(arc), 24, 5000 + it as u64 * 100);
             println!("   student rollouts: +{} samples, mean survival {:.1}/20 s", more.len(), surv);
@@ -493,7 +494,11 @@ fn eval_set(build: &str, assist: f32, mk: &(dyn Fn() -> Box<dyn controller::Ctl>
     let falls = ms.iter().filter(|m| m.falls > 0).count();
     let speed_err: f32 = ms.iter().map(|m| m.speed_err).sum::<f32>() / ms.len() as f32;
     let air: f32 = ms.iter().map(|m| m.flight_fraction).sum::<f32>() / ms.len() as f32;
-    serde_json::json!({"runs": ms.len(), "falls": falls, "survival_frac": surv / total, "mean_speed_err": speed_err, "mean_airborne": air})
+    let stride: f32 = ms.iter().map(|m| m.step_len_m).sum::<f32>() / ms.len() as f32;
+    let push: f32 = ms.iter().map(|m| m.pushoff_deg).sum::<f32>() / ms.len() as f32;
+    let tilt: f32 = ms.iter().map(|m| m.mean_tilt_deg).sum::<f32>() / ms.len() as f32;
+    serde_json::json!({"runs": ms.len(), "falls": falls, "survival_frac": surv / total, "mean_speed_err": speed_err, "mean_airborne": air,
+        "mean_step_m": stride, "mean_pushoff_deg": push, "mean_tilt_deg": tilt})
 }
 
 fn eval_distill(build: &str, assist: f32) {
@@ -501,17 +506,81 @@ fn eval_distill(build: &str, assist: f32) {
     let mut out = serde_json::Map::new();
     out.insert("teacher".into(), eval_set(build, assist, &move || Box::new(run_ctl::RunController::new(g, assist)) as Box<dyn controller::Ctl>));
     for r in 0.. {
-        let Ok(s) = fs::read_to_string(format!("out/distill/net_round{r}.json")) else { break };
+        let Ok(s) = fs::read_to_string(format!("out/distill_{build}/net_round{r}.json")) else { break };
         let net = std::sync::Arc::new(serde_json::from_str::<policy::Mlp>(&s).unwrap());
         out.insert(format!("round{r}"), eval_set(build, assist, &move || {
             Box::new(policy::StudentController { net: net.clone(), tracker: Default::default(), gait: g, assist, steps: 0 }) as Box<dyn controller::Ctl>
         }));
     }
     let s = serde_json::to_string_pretty(&out).unwrap();
-    fs::write("out/distill/eval.json", &s).unwrap();
+    fs::write(format!("out/distill_{build}/eval.json"), &s).unwrap();
     for (k, v) in &out {
         println!("{k:8} falls {}/{}  survival {:.0}%  speed err {:.2}  airborne {:.0}%", v["falls"], v["runs"],
             v["survival_frac"].as_f64().unwrap() * 100.0, v["mean_speed_err"].as_f64().unwrap(), v["mean_airborne"].as_f64().unwrap() * 100.0);
+    }
+}
+
+fn ppo_train(build: &str, iters: usize, init: &str) {
+    let assist = 0.0;
+    let gait = load_run_gait(build, assist);
+    let spec = build_spec(build);
+    let dir = format!("out/ppo_{build}");
+    fs::create_dir_all(&dir).ok();
+    let net: policy::Mlp = serde_json::from_str(&fs::read_to_string(init).expect("init net")).unwrap();
+    let mut pol = ppo::GaussPolicy { log_std: vec![(0.08f32).ln(); run_ctl::ACTION_DIM], net };
+    let mut value = policy::Mlp::new(&[policy::OBS_DIM, 128, 128, 1], 99);
+    value.in_mean = pol.net.in_mean.clone();
+    value.in_std = pol.net.in_std.clone();
+    let mut popt = pol.net.adam();
+    let mut vopt = value.adam();
+    let mut lsopt = (vec![0.0; run_ctl::ACTION_DIM], vec![0.0; run_ctl::ACTION_DIM], 0);
+    let cfg = ppo::RewardCfg { stride_target: 1.8 };
+    let mut log = Vec::new();
+    let checkpoint = |it: usize, pol: &ppo::GaussPolicy, log: &mut Vec<serde_json::Value>, extra: serde_json::Value| {
+        let arc = std::sync::Arc::new(pol.net.clone());
+        let show = eval_student(build, assist, gait, arc.clone(), &format!("PPO · iteration {it}"), Some((&format!("{dir}/clip_iter{it:03}.json"), 6.0)));
+        let ev = eval_set(build, assist, &move || {
+            Box::new(policy::StudentController { net: arc.clone(), tracker: Default::default(), gait, assist, steps: 0 }) as Box<dyn controller::Ctl>
+        });
+        println!("  ckpt {it}: eval falls {}/10 surv {:.0}% speed_err {:.2} stride {:.2} m pushoff {:.0}° tilt {:.0}° | run_show stride {:.2} speed {:.2}",
+            ev["falls"], ev["survival_frac"].as_f64().unwrap() * 100.0, ev["mean_speed_err"].as_f64().unwrap(),
+            ev["mean_step_m"].as_f64().unwrap(), ev["mean_pushoff_deg"].as_f64().unwrap(), ev["mean_tilt_deg"].as_f64().unwrap(),
+            show.step_len_m, show.mean_speed);
+        fs::write(format!("{dir}/policy_iter{it:03}.json"), serde_json::to_string(pol).unwrap()).unwrap();
+        log.push(serde_json::json!({"iter": it, "eval": ev, "run_show": show, "train": extra}));
+        fs::write(format!("{dir}/log.json"), serde_json::to_string_pretty(&*log).unwrap()).unwrap();
+    };
+    checkpoint(0, &pol, &mut log, serde_json::json!({}));
+    let warmup = 5;
+    for it in 1..=iters {
+        let t0 = std::time::Instant::now();
+        let batches: Vec<ppo::Batch> = std::thread::scope(|s| {
+            let (p, v) = (&pol, &value);
+            let hs: Vec<_> = (0..4).map(|k| s.spawn(move || ppo::rollout(p, v, spec, gait, 6000, (it * 17 + k) as u64 * 1_000_003, cfg))).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut b = ppo::Batch { obs: vec![], act: vec![], logp: vec![], adv: vec![], ret: vec![], ep_returns: vec![], ep_lengths: vec![] };
+        for x in batches {
+            b.obs.extend(x.obs);
+            b.act.extend(x.act);
+            b.logp.extend(x.logp);
+            b.adv.extend(x.adv);
+            b.ret.extend(x.ret);
+            b.ep_returns.extend(x.ep_returns);
+            b.ep_lengths.extend(x.ep_lengths);
+        }
+        let roll_s = t0.elapsed().as_secs_f32();
+        let lr_pi = if it <= warmup { 0.0 } else { 1e-5 };
+        let st = ppo::update(&mut pol, &mut value, &mut popt, &mut vopt, &mut lsopt, &b, lr_pi, 1e-3);
+        let ne = b.ep_returns.len().max(1) as f32;
+        let ret = b.ep_returns.iter().sum::<f32>() / ne;
+        let len = b.ep_lengths.iter().sum::<f32>() / ne;
+        let std_mean = pol.log_std.iter().map(|l| l.exp()).sum::<f32>() / pol.log_std.len() as f32;
+        println!("iter {it:3}: ep_return {ret:7.1} ep_len {len:4.1}s eps {:3} | kl {:.4} clip {:.2} vloss {:.3} std {:.3} | {:.0}s rollout {:.0}s total",
+            b.ep_returns.len(), st.kl, st.clip_frac, st.v_loss, std_mean, roll_s, t0.elapsed().as_secs_f32());
+        if it % 25 == 0 {
+            checkpoint(it, &pol, &mut log, serde_json::json!({"ep_return": ret, "ep_len": len, "kl": st.kl}));
+        }
     }
 }
 
@@ -539,6 +608,7 @@ fn main() {
         Some("diag") => diag(),
         Some("runreport") => run_report(),
         Some("evaldistill") => eval_distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
+        Some("ppo") => ppo_train(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(100), &a(4).unwrap()),
         Some("distill") => distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0), a(4).map(|s| s.parse().unwrap()).unwrap_or(5)),
         Some("runtune") => run_tune(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(100), a(4).map(|s| s.parse().unwrap()).unwrap_or(0.35)),
         Some("runrun") => {
