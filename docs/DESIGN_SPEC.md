@@ -1,6 +1,6 @@
 # Technical Design Specification: 3D Physics Robot Battler (Rust) — Rev. 2
 
-> Rev. 2 folds in the design review: verified Rapier API surface, scope cuts, damage rules,
+> Rev. 2 folds in the design review (plus scale & balance rules, §5.5): verified Rapier API surface, scope cuts, damage rules,
 > bracing/impact response, layered control with degradable "control laws", enemy AI,
 > keyboard + mouse control map, and real-robotics research references.
 
@@ -112,6 +112,23 @@ FEM is the biggest performance risk, so it is used only where it shows.
 * Baseline: wheeled/skid or hover (stable, predictable).
 * Walker: 2 legs × 4–5 joints as multibody chains. Balance via **Raibert foot placement** (neutral point) + **capture point** for step selection; capture point outside the support area ⇒ trigger stagger/knockdown.
 * Part/DOF budget is relaxed from Rev. 1 (4–8 links) to allow walkers; cap total joints per robot at ~20 and profile.
+
+### 5.5 Scale & balance
+Concept proportions in the genre are top-heavy (heavy chest, shoulder armor, high back units, thin legs). Under real physics that frame tips at ~10–12° and needs huge knee torque, so the parts follow these rules.
+
+* **Scale:** robots are **~3.5–4 m tall, ~3–4.5 t**. Physics runs at true scale with real gravity; larger-looking robots are a visual scale, not a physics scale. Bigger physical robots look slow and floaty (falls and jumps take longer relative to body size), and knee torque grows with mass × lever arm.
+* **Balance rules** (enforced or warned in the builder):
+
+| Rule | Target |
+|---|---|
+| Centre-of-mass height | ≤ ~55–60% of height. Reactor/batteries live in the pelvis |
+| Standing tip angle | ≥ 20° (wide stance, long/wide feet) |
+| Each arm incl. weapon | ≤ ~15% of total mass |
+| Back units | Mounted at the waist, not above the shoulders |
+| Left/right offset | Shown; small offsets allowed (balance assist compensates) |
+
+* **Active balance still required** for legged builds: tip angle only covers standing still. Walking relies on foot placement (Raibert / capture point) and ankle torque, whose authority is limited by foot size.
+* **Builder readout:** the parts screen shows the centre-of-mass marker, support base, tip angle, centre-of-mass height %, L/R offset and heaviest-arm %. In game these come from Rapier's mass properties, so builder and sim agree.
 
 ---
 
@@ -318,3 +335,4 @@ Optional: mouse motion during melee windup picks swing direction. Joint-level ar
 3. Arena-hit damage factor and brace multiplier values — playtest.
 4. Does mouse-directed melee swing direction stay, or fixed arcs only?
 5. Glam version alignment between Rapier 0.36.1 and the chosen Bevy release.
+6. Confirm the ~3.8 m / 3–4.5 t scale feels fast enough in the M1 movement test; if not, adjust gravity before adjusting scale.
