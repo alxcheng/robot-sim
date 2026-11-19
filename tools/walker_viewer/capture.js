@@ -28,7 +28,7 @@ const { execFileSync } = require('child_process');
     n++;
   }
   await browser.close();
-  const mp4 = path.join(outDir, `${rec.scenario}${rec.assist > 0 ? '' : '_no_assist'}.mp4`);
+  const mp4 = path.join(outDir, `${rec.scenario.replace(/[^A-Za-z0-9._-]+/g, '_')}${rec.assist > 0 ? '' : '_no_assist'}.mp4`);
   execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-framerate', String(fps), '-i', path.join(framesDir, 'f%05d.png'),
     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '23', mp4]);
   console.log(`${n} frames -> ${mp4}`);
