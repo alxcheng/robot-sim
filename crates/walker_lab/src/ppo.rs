@@ -123,9 +123,9 @@ fn omni_scenario(spec: RobotSpec, rng: &mut Rng, dur: f32) -> Scenario {
     while t < dur {
         heading += (rng.f() - 0.5) * 0.5;
         let k = rng.f();
-        let (v, l) = if k < 0.3 {
+        let (v, l) = if k < 0.25 {
             (-(0.5 + 1.5 * rng.f()), 0.0) // backwards
-        } else if k < 0.6 {
+        } else if k < 0.7 {
             (0.0, (0.4 + 0.8 * rng.f()) * if rng.f() < 0.5 { 1.0 } else { -1.0 }) // sidestep
         } else if k < 0.8 {
             ((rng.f() - 0.4) * 2.5, (rng.f() - 0.5) * 1.6) // diagonal
@@ -291,6 +291,10 @@ impl Env {
             - 0.03 * (tilt_deg - 10.0).max(0.0)
             - 0.002 * smooth;
         let speed_gate = (-e2 / (tol * 1.6)).exp();
+        // Sidestep: reward moving in the commanded sideways direction (penalise the opposite way).
+        if cmdv.lateral.abs() > 0.3 {
+            rew += 0.6 * (v_l * cmdv.lateral.signum() / cmdv.lateral.abs()).clamp(-1.0, 1.0);
+        }
         // Running-specific shaping only applies to fast forward commands.
         let running = cmdv.speed > 2.0;
         let stride_target = if cfg.speed_mode { (cmdv.speed / 2.2).max(0.6) } else { cfg.stride_target };
