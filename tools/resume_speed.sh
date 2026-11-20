@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Resume the light-build speed run from its latest checkpoint if it isn't running.
+# Usage: tools/resume_speed.sh [build] [final_iter]
+set -euo pipefail
+cd "$(dirname "$0")/.."
+build="${1:-GL}"
+final="${2:-1500}"
+dir="out/ppospeed_${build}"
+if pgrep -f "walker_lab ppospeed ${build}" >/dev/null; then
+  echo "running: $(tail -1 "out/ppospeed_${build}.log" | cut -c1-60)"
+  exit 0
+fi
+latest=$(ls "$dir"/policy_iter*.json | sort | tail -1)
+iter=$(basename "$latest" .json | sed 's/policy_iter0*//')
+vmax=$(python3 -c "import json,sys; l=json.load(open('$dir/log.json')); print([e['train'].get('vmax',3.0) for e in l if e['iter']==$iter][0])" 2>/dev/null || echo 3.0)
+left=$(( final - iter ))
+if [ "$left" -le 0 ]; then echo "finished at $iter"; exit 0; fi
+n=$(ls out/ppospeed_${build}_part*.log 2>/dev/null | wc -l)
+cp "out/ppospeed_${build}.log" "out/ppospeed_${build}_part$((n+1)).log"
+cp "$dir/log.json" "$dir/log_part$((n+1)).json"
+nohup ./target/release/walker_lab ppospeed "$build" "$left" "$latest" "$vmax" "$iter" > "out/ppospeed_${build}.log" 2>&1 &
+echo "resumed from iter $iter at vmax $vmax ($left iterations left)"
