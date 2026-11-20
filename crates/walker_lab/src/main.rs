@@ -567,10 +567,11 @@ fn eval_speeds(build: &str, assist: f32, gait: run_ctl::RunGait, net: std::sync:
 }
 
 fn ppo_train(build: &str, iters: usize, init: &str) {
-    ppo_train_mode(build, iters, init, false)
+    ppo_train_mode(build, iters, init, false, None, 0)
 }
 
-fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool) {
+/// `vmax0` / `iter0`: resume a speed run at a given top speed and iteration number.
+fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0: Option<f32>, iter0: usize) {
     let assist = 0.0;
     let gait = load_run_gait(build, assist);
     let spec = build_spec(build);
@@ -593,9 +594,9 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool) {
     let mut lsopt = (vec![0.0; run_ctl::ACTION_DIM], vec![0.0; run_ctl::ACTION_DIM], 0);
     let mut cfg = ppo::RewardCfg { stride_target: 1.8, vmax: 3.1, speed_mode };
     if speed_mode {
-        cfg.vmax = 3.0;
+        cfg.vmax = vmax0.unwrap_or(3.0);
     }
-    let (mut streak, mut vmax_log) = (0usize, vec![(0usize, cfg.vmax)]);
+    let (mut streak, mut vmax_log) = (0usize, vec![(iter0, cfg.vmax)]);
     let mut log = Vec::new();
     let checkpoint = |it: usize, pol: &ppo::GaussPolicy, log: &mut Vec<serde_json::Value>, extra: serde_json::Value| {
         let arc = std::sync::Arc::new(pol.net.clone());
@@ -637,9 +638,9 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool) {
         log.push(serde_json::json!({"iter": it, "eval": ev, "run_show": show, "train": extra}));
         fs::write(format!("{dir}/log.json"), serde_json::to_string_pretty(&*log).unwrap()).unwrap();
     };
-    checkpoint(0, &pol, &mut log, serde_json::json!({}));
-    let warmup = 5;
-    for it in 1..=iters {
+    checkpoint(iter0, &pol, &mut log, serde_json::json!({"vmax": cfg.vmax}));
+    let warmup = iter0 + 5;
+    for it in iter0 + 1..=iter0 + iters {
         let t0 = std::time::Instant::now();
         let batches: Vec<ppo::Batch> = std::thread::scope(|s| {
             let (p, v) = (&pol, &value);
@@ -786,7 +787,8 @@ fn main() {
         Some("runreport") => run_report(),
         Some("evaldistill") => eval_distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
         Some("pose") => pose(&a(2).unwrap(), &a(3).unwrap(), a(4).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
-        Some("ppospeed") => ppo_train_mode(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(1000), &a(4).unwrap(), true),
+        Some("ppospeed") => ppo_train_mode(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(1000), &a(4).unwrap(), true,
+            a(5).map(|s| s.parse().unwrap()), a(6).map(|s| s.parse().unwrap()).unwrap_or(0)),
         Some("ppo") => ppo_train(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(100), &a(4).unwrap()),
         Some("distill") => distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0), a(4).map(|s| s.parse().unwrap()).unwrap_or(5)),
         Some("runtune") => run_tune(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(100), a(4).map(|s| s.parse().unwrap()).unwrap_or(0.35)),
