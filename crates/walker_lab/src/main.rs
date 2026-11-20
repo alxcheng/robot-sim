@@ -682,6 +682,11 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
         }
         println!("iter {it:4}: ep_return {ret:7.1} ep_len {len:4.1}s eps {:3} surv {:.2} top_track {:.2} vmax {:.1} | kl {:.4} clip {:.2} vloss {:.3} std {:.3} | {:.0}s",
             b.ep_returns.len(), survive, top_track, cfg.vmax, st.kl, st.clip_frac, st.v_loss, std_mean, t0.elapsed().as_secs_f32());
+        // Lightweight save every 10 iterations so a restarted machine loses little work.
+        if speed_mode && it % 10 == 0 {
+            fs::write(format!("{dir}/latest_policy.json"), serde_json::to_string(&pol).unwrap()).unwrap();
+            fs::write(format!("{dir}/state.json"), serde_json::json!({"iter": it, "vmax": cfg.vmax}).to_string()).unwrap();
+        }
         let ck_every = if speed_mode { 50 } else { 25 };
         if it % ck_every == 0 {
             checkpoint(it, &pol, &mut log, serde_json::json!({"ep_return": ret, "ep_len": len, "kl": st.kl, "vmax": cfg.vmax, "vmax_history": vmax_log}));
