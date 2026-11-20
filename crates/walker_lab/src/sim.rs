@@ -131,7 +131,7 @@ pub fn command_at(sc: &Scenario, t: f32) -> Command {
         }
     }
     let a = ((t - t0) / 1.5).clamp(0.0, 1.0);
-    Command { speed: prev.speed + (cur.speed - prev.speed) * a, heading: cur.heading }
+    Command { speed: prev.speed + (cur.speed - prev.speed) * a, heading: cur.heading, lateral: prev.lateral + (cur.lateral - prev.lateral) * a }
 }
 
 pub fn run(sc: &Scenario, gait: Gait) -> (Metrics, Option<Recording>) {
@@ -339,7 +339,12 @@ pub fn run_with(sc: &Scenario, mk: &dyn Fn() -> Box<dyn Ctl>) -> (Metrics, Optio
 // ---------------- scenario library ----------------
 
 pub fn cmd(t: f32, speed: f32, heading: f32) -> (f32, Command) {
-    (t, Command { speed, heading })
+    (t, Command { speed, heading, lateral: 0.0 })
+}
+
+/// Command with a sideways component (m/s, +left).
+pub fn cmd_l(t: f32, speed: f32, lateral: f32, heading: f32) -> (f32, Command) {
+    (t, Command { speed, heading, lateral })
 }
 
 pub fn scenario(name: &str, assist: f32) -> Scenario {

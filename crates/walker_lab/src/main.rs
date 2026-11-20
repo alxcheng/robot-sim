@@ -567,15 +567,97 @@ fn eval_speeds(build: &str, assist: f32, gait: run_ctl::RunGait, net: std::sync:
 }
 
 fn ppo_train(build: &str, iters: usize, init: &str) {
-    ppo_train_mode(build, iters, init, false, None, 0)
+    ppo_train_mode(build, iters, init, false, None, 0, false)
+}
+
+/// Deterministic evaluation episode through the PPO environment (supports knockdowns), optionally recorded.
+fn run_env(build: &str, gait: run_ctl::RunGait, net: &policy::Mlp, sc: Scenario, mode: ppo::EpMode, knock_dir: f32, label: &str, rec: bool)
+    -> (ppo::Env, Vec<(f32, f32, f32)>, bool) {
+    let cfg = ppo::RewardCfg { stride_target: 1.8, vmax: 7.0, speed_mode: true, omni: true };
+    let dur = sc.duration;
+    let mut env = ppo::Env::with(build_spec(build), gait, sc, mode, knock_dir);
+    env.label = label.to_string();
+    if rec {
+        env.frames = Some(Vec::new());
+    }
+    let mut vel = Vec::new();
+    let mut fell = false;
+    while env.t() < dur {
+        let o = env.obs();
+        let a = net.forward_norm(&o);
+        let (_, term, trunc) = env.step(net, &a, cfg);
+        vel.push((env.t(), env.velocity().0, env.velocity().1));
+        if term {
+            fell = true;
+            break;
+        }
+        if trunc {
+            break;
+        }
+    }
+    (env, vel, fell)
+}
+
+/// Omni + get-up evaluation: backward jog, sidesteps, forward speed, and 4 knockdowns.
+fn eval_omni(build: &str, gait: run_ctl::RunGait, net: &policy::Mlp, dir: &str, it: usize, clips: bool) -> serde_json::Value {
+    let mk = |cmds: Vec<(f32, controller::Command)>, dur: f32| {
+        let mut sc = scenario("run_mid", 0.0);
+        sc.spec = build_spec(build);
+        sc.duration = dur;
+        sc.commands = cmds;
+        sc
+    };
+    let tests: Vec<(&str, f32, f32, Scenario)> = vec![
+        ("back", -1.5, 0.0, mk(vec![cmd(0.0, 1.0, 0.0), cmd_l(1.5, -1.5, 0.0, 0.0)], 8.0)),
+        ("left", 0.0, 1.0, mk(vec![cmd(0.0, 1.0, 0.0), cmd_l(1.5, 0.0, 1.0, 0.0)], 8.0)),
+        ("right", 0.0, -1.0, mk(vec![cmd(0.0, 1.0, 0.0), cmd_l(1.5, 0.0, -1.0, 0.0)], 8.0)),
+        ("fwd6", 6.0, 0.0, mk(vec![cmd(0.0, 1.5, 0.0), cmd(1.0, 3.75, 0.0), cmd(2.5, 6.0, 0.0)], 10.0)),
+    ];
+    let mut out = serde_json::Map::new();
+    for (name, vf, vl, sc) in tests {
+        let (_, vel, fell) = run_env(build, gait, net, sc, ppo::EpMode::Omni, 0.0, "", false);
+        let tail: Vec<_> = vel.iter().filter(|v| v.0 > 4.0).collect();
+        let n = tail.len().max(1) as f32;
+        let (mf, ml) = (tail.iter().map(|v| v.1).sum::<f32>() / n, tail.iter().map(|v| v.2).sum::<f32>() / n);
+        out.insert(name.into(), serde_json::json!({"cmd_fwd": vf, "cmd_left": vl, "fwd": mf, "left": ml, "fell": fell}));
+    }
+    let mut ups = Vec::new();
+    for k in 0..4 {
+        let mut sc = scenario("run_mid", 0.0);
+        sc.spec = build_spec(build);
+        sc.duration = ppo::GETUP_DUR;
+        sc.commands = vec![cmd(0.0, 0.0, 0.0)];
+        let (env, _, _) = run_env(build, gait, net, sc, ppo::EpMode::GetUp, k as f32 * 1.5708, "", false);
+        ups.push(serde_json::json!({"stood_at_end": env.standing(), "first_stand_s": env.first_stand_t.map(|t| t - ppo::KNOCK_T)}));
+    }
+    out.insert("getup".into(), serde_json::Value::Array(ups));
+    if clips {
+        // Demo: forward → backwards → sidestep left → sidestep right, then a knockdown.
+        let demo = mk(vec![cmd(0.0, 1.5, 0.0), cmd_l(3.0, -1.5, 0.0, 0.0), cmd_l(6.0, 0.0, 1.0, 0.0), cmd_l(9.0, 0.0, -1.0, 0.0)], 12.0);
+        let (env, _, _) = run_env(build, gait, net, demo, ppo::EpMode::Omni, 0.0, "", true);
+        save_clip(&env, &format!("{dir}/clip_omni_iter{it:04}.json"), &format!("OMNI · iter {it} · fwd → back → left → right"));
+        let mut sc = scenario("run_mid", 0.0);
+        sc.spec = build_spec(build);
+        sc.duration = ppo::GETUP_DUR;
+        sc.commands = vec![cmd(0.0, 0.0, 0.0)];
+        let (env, _, _) = run_env(build, gait, net, sc, ppo::EpMode::GetUp, 0.0, "", true);
+        save_clip(&env, &format!("{dir}/clip_getup_iter{it:04}.json"), &format!("GET UP · iter {it}"));
+    }
+    serde_json::Value::Object(out)
+}
+
+fn save_clip(env: &ppo::Env, path: &str, name: &str) {
+    let rec = serde_json::json!({ "scenario": name, "assist": 0.0, "dt": sim::DT, "links": env.links(), "platform": null,
+        "pushes": [], "frames": env.frames.as_ref().unwrap() });
+    fs::write(path, serde_json::to_string(&rec).unwrap()).unwrap();
 }
 
 /// `vmax0` / `iter0`: resume a speed run at a given top speed and iteration number.
-fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0: Option<f32>, iter0: usize) {
+fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0: Option<f32>, iter0: usize, omni: bool) {
     let assist = 0.0;
     let gait = load_run_gait(build, assist);
     let spec = build_spec(build);
-    let dir = if speed_mode { format!("out/ppospeed_{build}") } else { format!("out/ppo_{build}") };
+    let dir = if omni { format!("out/ppoomni_{build}") } else if speed_mode { format!("out/ppospeed_{build}") } else { format!("out/ppo_{build}") };
     fs::create_dir_all(&dir).ok();
     let txt = fs::read_to_string(init).expect("init net");
     // Accept either a saved PPO policy (net + log-std) or a distilled network.
@@ -586,13 +668,21 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
             ppo::GaussPolicy { log_std: vec![(0.08f32).ln(); run_ctl::ACTION_DIM], net }
         }
     };
+    // Older networks have fewer inputs (no sideways command): widen with zero weights.
+    pol.net.expand_inputs(policy::OBS_DIM);
+    if omni {
+        // New skills need some exploration again.
+        for l in pol.log_std.iter_mut() {
+            *l = l.max((0.12f32).ln());
+        }
+    }
     let mut value = policy::Mlp::new(&[policy::OBS_DIM, 128, 128, 1], 99);
     value.in_mean = pol.net.in_mean.clone();
     value.in_std = pol.net.in_std.clone();
     let mut popt = pol.net.adam();
     let mut vopt = value.adam();
     let mut lsopt = (vec![0.0; run_ctl::ACTION_DIM], vec![0.0; run_ctl::ACTION_DIM], 0);
-    let mut cfg = ppo::RewardCfg { stride_target: 1.8, vmax: 3.1, speed_mode };
+    let mut cfg = ppo::RewardCfg { stride_target: 1.8, vmax: 3.1, speed_mode, omni };
     if speed_mode {
         cfg.vmax = vmax0.unwrap_or(3.0);
     }
@@ -600,6 +690,17 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
     let mut log = Vec::new();
     let checkpoint = |it: usize, pol: &ppo::GaussPolicy, log: &mut Vec<serde_json::Value>, extra: serde_json::Value| {
         let arc = std::sync::Arc::new(pol.net.clone());
+        if omni {
+            let ev = eval_omni(build, gait, &pol.net, &dir, it, it % 100 == 0);
+            let g = &ev["getup"];
+            let stood = (0..4).filter(|k| g[*k]["stood_at_end"].as_bool().unwrap_or(false)).count();
+            let f = |k: &str| format!("{}{:+.1}/{:+.1}{}", k, ev[k]["fwd"].as_f64().unwrap(), ev[k]["left"].as_f64().unwrap(), if ev[k]["fell"].as_bool().unwrap() { "✗" } else { "" });
+            println!("  omni {it}: {} | {} | {} | {} | get-up {stood}/4", f("back"), f("left"), f("right"), f("fwd6"));
+            fs::write(format!("{dir}/policy_iter{it:04}.json"), serde_json::to_string(pol).unwrap()).unwrap();
+            log.push(serde_json::json!({"iter": it, "omni": ev, "train": extra}));
+            fs::write(format!("{dir}/log.json"), serde_json::to_string_pretty(&*log).unwrap()).unwrap();
+            return;
+        }
         if speed_mode {
             let sp = eval_speeds(build, assist, gait, arc.clone());
             let line: Vec<String> = sp.iter().map(|e| format!("{}→{:.1}{} step {:.2}m@{:.1}Hz push {:.0}°",
@@ -671,7 +772,7 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
         let survive = b.ep_lengths.iter().filter(|l| **l >= 9.9).count() as f32 / ne;
         let top: Vec<f32> = b.ep_track.iter().zip(&b.ep_cmd).filter(|(_, c)| **c >= cfg.vmax - 1.0).map(|(t, _)| *t).collect();
         let top_track = if top.is_empty() { 0.0 } else { top.iter().sum::<f32>() / top.len() as f32 };
-        if speed_mode && it > warmup {
+        if speed_mode && !omni && it > warmup {
             if survive >= 0.85 && top_track >= 0.55 { streak += 1 } else { streak = 0 }
             if streak >= 5 && cfg.vmax < 7.5 {
                 cfg.vmax = (cfg.vmax + 0.5).min(7.5);
@@ -683,7 +784,7 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
         println!("iter {it:4}: ep_return {ret:7.1} ep_len {len:4.1}s eps {:3} surv {:.2} top_track {:.2} vmax {:.1} | kl {:.4} clip {:.2} vloss {:.3} std {:.3} | {:.0}s",
             b.ep_returns.len(), survive, top_track, cfg.vmax, st.kl, st.clip_frac, st.v_loss, std_mean, t0.elapsed().as_secs_f32());
         // Lightweight save every 10 iterations so a restarted machine loses little work.
-        if speed_mode && it % 10 == 0 {
+        if (speed_mode || omni) && it % 10 == 0 {
             fs::write(format!("{dir}/latest_policy.json"), serde_json::to_string(&pol).unwrap()).unwrap();
             fs::write(format!("{dir}/state.json"), serde_json::json!({"iter": it, "vmax": cfg.vmax}).to_string()).unwrap();
         }
@@ -793,7 +894,10 @@ fn main() {
         Some("evaldistill") => eval_distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
         Some("pose") => pose(&a(2).unwrap(), &a(3).unwrap(), a(4).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
         Some("ppospeed") => ppo_train_mode(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(1000), &a(4).unwrap(), true,
-            a(5).map(|s| s.parse().unwrap()), a(6).map(|s| s.parse().unwrap()).unwrap_or(0)),
+            a(5).map(|s| s.parse().unwrap()), a(6).map(|s| s.parse().unwrap()).unwrap_or(0), false),
+        // Omnidirectional jogging + get-up (speed rewards kept for forward running episodes).
+        Some("ppoomni") => ppo_train_mode(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(1000), &a(4).unwrap(), true,
+            Some(7.0), a(5).map(|s| s.parse().unwrap()).unwrap_or(0), true),
         Some("ppo") => ppo_train(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(100), &a(4).unwrap()),
         Some("distill") => distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0), a(4).map(|s| s.parse().unwrap()).unwrap_or(5)),
         Some("runtune") => run_tune(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(100), a(4).map(|s| s.parse().unwrap()).unwrap_or(0.35)),

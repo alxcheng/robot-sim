@@ -7,7 +7,7 @@ use crate::run_ctl::*;
 use rapier3d::prelude::*;
 use serde::{Deserialize, Serialize};
 
-pub const OBS_DIM: usize = 58;
+pub const OBS_DIM: usize = 59;
 
 /// Contact history the policy is allowed to see (derived from sensors, not from the teacher).
 #[derive(Clone, Copy, Default)]
@@ -92,6 +92,8 @@ pub fn observe(w: &PhysicsWorld, r: &Robot, cmd: Command, tr: &ContactTracker) -
         push(a);
         push(e);
     }
+    // Appended last so older networks (58 inputs) can be widened with zero weights.
+    push(cmd.lateral / 2.0);
     debug_assert_eq!(k, OBS_DIM);
     o
 }
@@ -189,8 +191,27 @@ impl Mlp {
         (self.out_mean, self.out_std) = stats(ys);
     }
 
+    /// Widen the input layer to `n` inputs; new inputs get zero weights (behaviour unchanged).
+    pub fn expand_inputs(&mut self, n: usize) {
+        let l = &mut self.layers[0];
+        if l.n_in >= n {
+            return;
+        }
+        let mut w = Vec::with_capacity(l.n_out * n);
+        for o in 0..l.n_out {
+            w.extend_from_slice(&l.w[o * l.n_in..(o + 1) * l.n_in]);
+            w.extend(std::iter::repeat(0.0).take(n - l.n_in));
+        }
+        l.w = w;
+        self.in_mean.resize(n, 0.0);
+        self.in_std.resize(n, 1.0);
+        l.n_in = n;
+    }
+
     /// Forward pass on normalised input; returns activations of every layer (last = normalised output).
+    /// Inputs beyond the network's width are ignored (older, narrower networks).
     fn forward_acts(&self, x: &[f32]) -> Vec<Vec<f32>> {
+        let x = &x[..self.in_mean.len().min(x.len())];
         let mut acts = vec![x.iter().enumerate().map(|(i, v)| (v - self.in_mean[i]) / self.in_std[i]).collect::<Vec<f32>>()];
         for (li, l) in self.layers.iter().enumerate() {
             let a = acts.last().unwrap();

@@ -44,7 +44,24 @@ pub struct RewardCfg {
     pub vmax: f32,
     /// Speed mode: tracking tolerance and stride target scale with commanded speed.
     pub speed_mode: bool,
+    /// Mix in omnidirectional jogging and knockdown/get-up episodes.
+    pub omni: bool,
 }
+
+/// Kind of practice episode.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum EpMode {
+    /// Forward running (speed training).
+    Run,
+    /// Jogging in any direction: backwards, sideways, diagonal, slow forward.
+    Omni,
+    /// Knocked down (shove + limp motors), then must get up and stand.
+    GetUp,
+}
+
+pub const KNOCK_T: f32 = 0.3;
+pub const LIMP_S: f32 = 1.2;
+pub const GETUP_DUR: f32 = 8.0;
 
 pub struct Env {
     w: PhysicsWorld,
@@ -62,6 +79,13 @@ pub struct Env {
     toe_peak: [f32; 2],
     pub ep_return: f32,
     last_td_t: f32,
+    pub mode: EpMode,
+    knock_dir: f32,
+    /// Continuous time spent standing upright (get-up episodes) and when it first stood.
+    pub stood_s: f32,
+    pub first_stand_t: Option<f32>,
+    pub frames: Option<Vec<crate::sim::Frame>>,
+    pub label: String,
 }
 
 fn random_scenario(spec: RobotSpec, rng: &mut Rng, dur: f32, vmax: f32) -> Scenario {
@@ -84,38 +108,131 @@ fn random_scenario(spec: RobotSpec, rng: &mut Rng, dur: f32, vmax: f32) -> Scena
     sc
 }
 
+/// Jogging in any direction: commands change every 3 s.
+fn omni_scenario(spec: RobotSpec, rng: &mut Rng, dur: f32) -> Scenario {
+    let mut sc = scenario("run_mid", 0.0);
+    sc.spec = spec;
+    sc.duration = dur;
+    sc.commands.clear();
+    let (mut t, mut heading) = (0.0, 0.0);
+    // Start from a slow forward jog so the first transition is from a known gait.
+    sc.commands.push(cmd(0.0, 1.0, 0.0));
+    t += 1.5;
+    while t < dur {
+        heading += (rng.f() - 0.5) * 0.5;
+        let k = rng.f();
+        let (v, l) = if k < 0.3 {
+            (-(0.5 + 1.5 * rng.f()), 0.0) // backwards
+        } else if k < 0.6 {
+            (0.0, (0.4 + 0.8 * rng.f()) * if rng.f() < 0.5 { 1.0 } else { -1.0 }) // sidestep
+        } else if k < 0.8 {
+            ((rng.f() - 0.4) * 2.5, (rng.f() - 0.5) * 1.6) // diagonal
+        } else {
+            (0.5 + 1.5 * rng.f(), 0.0) // slow forward
+        };
+        sc.commands.push(cmd_l(t, v, l, heading));
+        t += 3.0;
+    }
+    sc
+}
+
 impl Env {
-    pub fn new(spec: RobotSpec, gait: RunGait, seed: u64, vmax: f32) -> Self {
+    pub fn new(spec: RobotSpec, gait: RunGait, seed: u64, vmax: f32, omni: bool) -> Self {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-        let sc = random_scenario(spec, &mut rng, 10.0, vmax);
+        let k = rng.f();
+        let mode = if !omni || k < 0.4 { EpMode::Run } else if k < 0.75 { EpMode::Omni } else { EpMode::GetUp };
+        let sc = match mode {
+            EpMode::Run => random_scenario(spec, &mut rng, 10.0, vmax),
+            EpMode::Omni => omni_scenario(spec, &mut rng, 10.0),
+            EpMode::GetUp => {
+                let mut sc = scenario("run_mid", 0.0);
+                sc.spec = spec;
+                sc.duration = GETUP_DUR;
+                sc.commands = vec![cmd(0.0, 0.0, 0.0)];
+                sc
+            }
+        };
+        let knock_dir = rng.f() * std::f32::consts::TAU;
+        Self::with(spec, gait, sc, mode, knock_dir)
+    }
+
+    /// Fixed episode (evaluation / clips).
+    pub fn with(_spec: RobotSpec, gait: RunGait, sc: Scenario, mode: EpMode, knock_dir: f32) -> Self {
         let (w, r) = build_world(&sc);
         Env {
             w, r, sc, t: 0.0, tracker: Default::default(), gait, prev_a: vec![0.0; ACTION_DIM],
             last_td: None, foot_prev: [true; 2], toe_peak: [0.0; 2], ep_return: 0.0, track_sum: 0.0, track_n: 0.0, cmd_sum: 0.0, last_td_t: -1.0,
+            mode, knock_dir, stood_s: 0.0, first_stand_t: None, frames: None, label: String::new(),
         }
+    }
+
+    pub fn t(&self) -> f32 {
+        self.t
+    }
+
+    pub fn links(&self) -> Vec<crate::robot::LinkInfo> {
+        self.r.links.clone()
+    }
+
+    /// Heading-frame velocity (forward, left) and yaw.
+    pub fn velocity(&self) -> (f32, f32, f32) {
+        let tel = telemetry(&self.w, &self.r, None);
+        let v = Rotation::from_rotation_y(-tel.yaw) * Vector::from_array(tel.com_vel);
+        (v.z, v.x, tel.yaw)
+    }
+
+    pub fn standing(&self) -> bool {
+        let tel = telemetry(&self.w, &self.r, None);
+        tel.trunk_tilt < 0.35 && tel.com[1] > 1.6 && tel.feet_in_contact >= 1
     }
 
     pub fn obs(&self) -> [f32; OBS_DIM] {
         observe(&self.w, &self.r, command_at(&self.sc, self.t), &self.tracker)
     }
 
+    fn record(&mut self, cmdv: Command, tel: &Telemetry, c: [bool; 2]) {
+        if let Some(frames) = self.frames.as_mut() {
+            let b = self.r.links.iter().map(|l| {
+                let body = &self.w.bodies[l.body];
+                let (p, q) = (body.translation(), body.rotation());
+                [p.x, p.y, p.z, q.x, q.y, q.z, q.w]
+            }).collect();
+            frames.push(crate::sim::Frame {
+                t: self.t, b, speed: tel.fwd_speed, cmd_speed: cmdv.speed, heading: tel.yaw, cmd_heading: cmdv.heading,
+                label: self.label.clone(), feet: tel.feet_in_contact, toe: [0.0; 2], contact: c,
+            });
+        }
+    }
+
     /// Advance one control tick with a normalised action. Returns (reward, terminal, truncated).
     pub fn step(&mut self, net: &Mlp, a_norm: &[f32], cfg: RewardCfg) -> (f32, bool, bool) {
         let cmdv = command_at(&self.sc, self.t);
         let real: Vec<f32> = a_norm.iter().enumerate().map(|(i, v)| v * net.out_std[i] + net.out_mean[i]).collect();
-        let act = Action::from_slice(&real);
+        let mut act = Action::from_slice(&real);
+        let knock = self.mode == EpMode::GetUp && self.t >= KNOCK_T && self.t < KNOCK_T + LIMP_S;
+        if knock {
+            // Knocked down: motors go limp briefly.
+            for l in 0..2 {
+                for k in 0..7 {
+                    act.kp[l][k] *= 0.05;
+                }
+            }
+        }
         apply_action(&mut self.w, &self.r, &act, self.gait.kd);
-        reflexes(&mut self.w, &self.r, self.gait.wheel_k, 0.0, self.gait.lean + self.gait.lean_v * cmdv.speed);
-        // Pushes as short force pulses (see sim.rs).
+        reflexes(&mut self.w, &self.r, self.gait.wheel_k, 0.0, self.gait.lean + self.gait.lean_v * cmdv.speed.max(0.0));
         {
             let trunk = &mut self.w.bodies[self.r.trunk];
             trunk.reset_forces(true);
+            let yaw = yaw_of(trunk.rotation());
             for p in &self.sc.pushes {
                 if self.t >= p.t && self.t < p.t + 0.1 {
-                    let yaw = yaw_of(trunk.rotation());
                     let dv = Rotation::from_rotation_y(yaw) * Vector::new(p.dv_left, 0.0, p.dv_fwd);
                     trunk.add_force(dv * self.r.total_mass / 0.1, true);
                 }
+            }
+            if self.mode == EpMode::GetUp && self.t >= KNOCK_T && self.t < KNOCK_T + 0.1 {
+                let dv = Vector::new(3.0 * self.knock_dir.sin(), 0.0, 3.0 * self.knock_dir.cos());
+                trunk.add_force(dv * self.r.total_mass / 0.1, true);
             }
         }
         self.w.step();
@@ -123,31 +240,59 @@ impl Env {
         let c = [foot_in_contact(&self.w, &self.r.legs[0]), foot_in_contact(&self.w, &self.r.legs[1])];
         self.tracker.update(c, DT);
         let tel = telemetry(&self.w, &self.r, None);
-
+        self.record(cmdv, &tel, c);
         let finite = tel.com.iter().all(|v| v.is_finite());
+        let smooth: f32 = a_norm.iter().zip(&self.prev_a).map(|(a, b)| (a - b) * (a - b)).sum();
+        self.prev_a = a_norm.to_vec();
+
+        if self.mode == EpMode::GetUp {
+            if !finite {
+                return (-10.0, true, false);
+            }
+            if self.t < KNOCK_T + LIMP_S {
+                return (0.0, false, false);
+            }
+            // Get up: height and uprightness, a bonus for standing, then stand still.
+            let up = tel.trunk_tilt.cos().max(0.0);
+            let h = ((tel.com[1] - 0.6) / (1.9 - 0.6)).clamp(0.0, 1.0);
+            let standing = tel.trunk_tilt < 0.35 && tel.com[1] > 1.6 && tel.feet_in_contact >= 1;
+            let speed = (tel.com_vel[0].powi(2) + tel.com_vel[2].powi(2)).sqrt();
+            let mut rew = 0.8 * h + 0.8 * up - 0.002 * smooth;
+            if standing {
+                rew += 1.5 - 0.3 * speed;
+                self.stood_s += DT;
+                self.first_stand_t.get_or_insert(self.t);
+            } else {
+                self.stood_s = 0.0;
+            }
+            self.ep_return += rew;
+            return (rew, false, self.t >= self.sc.duration);
+        }
+
         let fallen = !finite || tel.trunk_tilt > 0.9 || tel.com[1] < 1.2;
         if fallen {
             return (-10.0, true, false);
         }
-        let v_err = tel.fwd_speed - cmdv.speed;
+        let vh = Rotation::from_rotation_y(-tel.yaw) * Vector::from_array(tel.com_vel);
+        let (v_f, v_l) = (vh.z, vh.x);
+        let e2 = (v_f - cmdv.speed).powi(2) + (v_l - cmdv.lateral).powi(2);
         let head_err = wrap(cmdv.heading - tel.yaw);
         let tilt_deg = tel.trunk_tilt.to_degrees();
-        let smooth: f32 = a_norm.iter().zip(&self.prev_a).map(|(a, b)| (a - b) * (a - b)).sum();
-        self.prev_a = a_norm.to_vec();
-        // Speed tolerance grows with commanded speed in speed mode.
-        let tol = if cfg.speed_mode { 0.3 * (cmdv.speed / 2.5).max(1.0).powi(2) } else { 0.3 };
-        let track = (-v_err * v_err / tol).exp();
+        // Speed tolerance grows with commanded forward speed in speed mode.
+        let tol = if cfg.speed_mode { 0.3 * (cmdv.speed.abs() / 2.5).max(1.0).powi(2) } else { 0.3 };
+        let track = (-e2 / tol).exp();
         self.track_sum += track;
         self.track_n += 1.0;
         self.cmd_sum += cmdv.speed;
         let mut rew = 0.5 + 1.0 * track + 0.3 * (-head_err * head_err / 0.05).exp()
             - 0.03 * (tilt_deg - 10.0).max(0.0)
             - 0.002 * smooth;
-        let speed_gate = (-v_err * v_err / (tol * 1.6)).exp();
+        let speed_gate = (-e2 / (tol * 1.6)).exp();
+        // Running-specific shaping only applies to fast forward commands.
+        let running = cmdv.speed > 2.0;
         let stride_target = if cfg.speed_mode { (cmdv.speed / 2.2).max(0.6) } else { cfg.stride_target };
-        let push_w = if cfg.speed_mode { 10.0 } else { 1.0 };
-        // Bounding: reward airborne time (both feet off the ground) while on speed.
-        if cfg.speed_mode && !c[0] && !c[1] {
+        let push_w = if !running { 0.0 } else if cfg.speed_mode { 10.0 } else { 1.0 };
+        if cfg.speed_mode && running && cmdv.speed > 3.0 && !c[0] && !c[1] {
             rew += 0.6 * speed_gate;
         }
         for k in 0..2 {
@@ -158,24 +303,23 @@ impl Env {
                 self.toe_peak[k] = self.toe_peak[k].max(toe);
             }
             if c[k] && !self.foot_prev[k] {
-                // Footfall: stride reward, gated on holding the commanded speed.
                 let p = [tel.com[0], tel.com[2]];
-                if let Some(q) = self.last_td {
-                    let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
-                    rew += 3.0 * (d / stride_target).clamp(0.0, 1.2) * speed_gate;
-                }
-                self.last_td = Some(p);
-                // Step-rate penalty: steps faster than 2.5 per second cost reward.
-                if cfg.speed_mode && self.last_td_t >= 0.0 {
-                    let interval = self.t - self.last_td_t;
-                    if interval < 0.4 {
-                        rew -= 25.0 * (0.4 - interval) / 0.4;
+                if running {
+                    if let Some(q) = self.last_td {
+                        let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
+                        rew += 3.0 * (d / stride_target).clamp(0.0, 1.2) * speed_gate;
+                    }
+                    if cfg.speed_mode && cmdv.speed > 3.0 && self.last_td_t >= 0.0 {
+                        let interval = self.t - self.last_td_t;
+                        if interval < 0.4 {
+                            rew -= 25.0 * (0.4 - interval) / 0.4;
+                        }
                     }
                 }
+                self.last_td = Some(p);
                 self.last_td_t = self.t;
             }
             if !c[k] && self.foot_prev[k] {
-                // Lift-off: push-off reward.
                 rew += push_w * (self.toe_peak[k] / 20.0).clamp(0.0, 1.0) * speed_gate;
                 self.toe_peak[k] = 0.0;
             }
@@ -212,7 +356,7 @@ pub fn logp(mu: &[f32], log_std: &[f32], a: &[f32]) -> f32 {
 pub fn rollout(pol: &GaussPolicy, value: &Mlp, spec: RobotSpec, gait: RunGait, steps: usize, seed: u64, cfg: RewardCfg) -> Batch {
     let (gamma, lam) = (0.99f32, 0.95f32);
     let mut rng = Rng(seed | 1);
-    let mut env = Env::new(spec, gait, seed, cfg.vmax);
+    let mut env = Env::new(spec, gait, seed, cfg.vmax, cfg.omni);
     let mut episode = 0u64;
     let (mut obs, mut act, mut lp, mut rews, mut vals, mut dones, mut boots) = (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
     let (mut ep_returns, mut ep_lengths, mut ep_track, mut ep_cmd) = (vec![], vec![], vec![], vec![]);
@@ -237,7 +381,7 @@ pub fn rollout(pol: &GaussPolicy, value: &Mlp, spec: RobotSpec, gait: RunGait, s
             ep_track.push(env.track_sum / env.track_n.max(1.0));
             ep_cmd.push(env.cmd_sum / env.track_n.max(1.0));
             episode += 1;
-            env = Env::new(spec, gait, seed.wrapping_add(episode * 7919), cfg.vmax);
+            env = Env::new(spec, gait, seed.wrapping_add(episode * 7919), cfg.vmax, cfg.omni);
         }
     }
     // Last state bootstrap for an unfinished episode.

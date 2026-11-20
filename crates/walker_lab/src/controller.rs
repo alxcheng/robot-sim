@@ -63,8 +63,11 @@ impl Default for Gait {
 
 #[derive(Clone, Copy, Default)]
 pub struct Command {
+    /// Forward speed in the heading frame (m/s); negative = backwards.
     pub speed: f32,
     pub heading: f32,
+    /// Sideways speed in the heading frame (m/s); positive = left.
+    pub lateral: f32,
 }
 
 pub struct Controller {
