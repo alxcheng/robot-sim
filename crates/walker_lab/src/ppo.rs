@@ -61,6 +61,7 @@ pub struct Env {
     foot_prev: [bool; 2],
     toe_peak: [f32; 2],
     pub ep_return: f32,
+    last_td_t: f32,
 }
 
 fn random_scenario(spec: RobotSpec, rng: &mut Rng, dur: f32, vmax: f32) -> Scenario {
@@ -90,7 +91,7 @@ impl Env {
         let (w, r) = build_world(&sc);
         Env {
             w, r, sc, t: 0.0, tracker: Default::default(), gait, prev_a: vec![0.0; ACTION_DIM],
-            last_td: None, foot_prev: [true; 2], toe_peak: [0.0; 2], ep_return: 0.0, track_sum: 0.0, track_n: 0.0, cmd_sum: 0.0,
+            last_td: None, foot_prev: [true; 2], toe_peak: [0.0; 2], ep_return: 0.0, track_sum: 0.0, track_n: 0.0, cmd_sum: 0.0, last_td_t: -1.0,
         }
     }
 
@@ -144,7 +145,11 @@ impl Env {
             - 0.002 * smooth;
         let speed_gate = (-v_err * v_err / (tol * 1.6)).exp();
         let stride_target = if cfg.speed_mode { (cmdv.speed / 2.2).max(0.6) } else { cfg.stride_target };
-        let push_w = if cfg.speed_mode { 2.0 } else { 1.0 };
+        let push_w = if cfg.speed_mode { 4.0 } else { 1.0 };
+        // Bounding: reward airborne time (both feet off the ground) while on speed.
+        if cfg.speed_mode && !c[0] && !c[1] {
+            rew += 0.3 * speed_gate;
+        }
         for k in 0..2 {
             let fb = &self.w.bodies[self.r.legs[k].bodies[B_FOOT]];
             let f = *fb.rotation() * Vector::Z;
@@ -160,6 +165,14 @@ impl Env {
                     rew += 3.0 * (d / stride_target).clamp(0.0, 1.2) * speed_gate;
                 }
                 self.last_td = Some(p);
+                // Step-rate penalty: steps faster than 2.5 per second cost reward.
+                if cfg.speed_mode && self.last_td_t >= 0.0 {
+                    let interval = self.t - self.last_td_t;
+                    if interval < 0.4 {
+                        rew -= 2.0 * (0.4 - interval) / 0.4;
+                    }
+                }
+                self.last_td_t = self.t;
             }
             if !c[k] && self.foot_prev[k] {
                 // Lift-off: push-off reward.
