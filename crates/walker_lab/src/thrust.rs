@@ -27,7 +27,11 @@ pub fn desired_force(r: &Robot, yaw: f32, input: [f32; 3], dash: bool) -> Vector
     let horiz = if dash { 15.0 } else { 4.0 };
     let up = if dash { 2.0 } else { 1.3 };
     let h = Rotation::from_rotation_y(yaw) * Vector::new(input[0] * horiz * m, 0.0, input[2] * horiz * m);
-    let v = if input[1] > 0.0 { input[1] * up * m * g } else { 0.0 };
+    // Horizontal boosting also carries part of the weight (skimming), so the feet aren't dragged
+    // sideways under full load; lift scales with how hard the horizontal input is.
+    let hmag = (input[0] * input[0] + input[2] * input[2]).sqrt().min(1.0);
+    let skim: f32 = std::env::var("THR_SKIM").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5);
+    let v = (if input[1] > 0.0 { input[1] * up } else { 0.0 }).max(skim * hmag) * m * g;
     h + Vector::new(0.0, v, 0.0)
 }
 
@@ -74,15 +78,19 @@ pub fn allocate(w: &PhysicsWorld, r: &Robot, f_des: Vector, tau_des: Vector, das
     ThrustOut { forces: pos.into_iter().zip(f).collect() }
 }
 
-/// Attitude-hold torque (world) that keeps the pelvis upright while thrusting.
-pub fn attitude_torque(w: &PhysicsWorld, r: &Robot, strength: f32) -> Vector {
+/// Attitude-hold torque (world) that keeps the pelvis upright and on the commanded heading while
+/// thrusting (a sideways push with a foot planted otherwise spins the robot about that foot).
+pub fn attitude_torque(w: &PhysicsWorld, r: &Robot, strength: f32, heading: f32) -> Vector {
     let rot = *w.bodies[r.trunk].rotation();
     let yaw = yaw_of(&rot);
     let inv_h = Rotation::from_rotation_y(-yaw);
     let (p, rl) = trunk_angles(&rot, &inv_h);
     let om = inv_h * w.bodies[r.trunk].angvel();
     let s = strength * r.total_mass / 2087.0;
-    let tau_h = Vector::new(-(60_000.0 * s * p + 15_000.0 * s * om.x), 0.0, -(60_000.0 * s * rl + 15_000.0 * s * om.z));
+    let yaw_err = wrap(heading - yaw);
+    let yk: f32 = std::env::var("THR_YAWK").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let tau_y = yk * 30_000.0 * s * yaw_err.clamp(-0.5, 0.5) - yk * 8_000.0 * s * om.y;
+    let tau_h = Vector::new(-(60_000.0 * s * p + 15_000.0 * s * om.x), tau_y, -(60_000.0 * s * rl + 15_000.0 * s * om.z));
     Rotation::from_rotation_y(yaw) * tau_h
 }
 
@@ -105,7 +113,7 @@ pub fn apply(w: &mut PhysicsWorld, r: &Robot, cmd: &Command) -> Vec<(Vector, Vec
     }
     let yaw = yaw_of(w.bodies[r.trunk].rotation());
     let f_des = desired_force(r, yaw, cmd.thrust, cmd.dash);
-    let tau = attitude_torque(w, r, 1.0);
+    let tau = attitude_torque(w, r, 1.0, cmd.heading);
     let out = allocate(w, r, f_des, tau, cmd.dash);
     for (t, (p, f)) in r.thrusters.iter().zip(&out.forces) {
         w.bodies[t.body].add_force_at_point(*f, *p, true);

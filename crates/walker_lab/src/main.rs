@@ -939,6 +939,24 @@ fn thrust_script() -> (Vec<(f32, controller::Command)>, Vec<(f32, String)>) {
     (cmds, labels)
 }
 
+/// Allocation residuals at the standing pose for each thrust direction.
+fn thrust_check(build: &str) {
+    use rapier3d::prelude::Vector;
+    let mut sc = scenario("run_mid", 0.0);
+    sc.spec = build_spec(build);
+    let (w, r) = sim::build_world(&sc);
+    for (name, dir, dash) in [("L", [1.0, 0.0, 0.0], false), ("F", [0.0, 0.0, 1.0], false), ("B", [0.0, 0.0, -1.0], false),
+        ("U", [0.0, 1.0, 0.0], false), ("dashF", [0.0, 0.0, 1.0], true), ("dashL", [1.0, 0.0, 0.0], true)] {
+        let fd = thrust::desired_force(&r, 0.0, dir, dash);
+        let out = thrust::allocate(&w, &r, fd, Vector::ZERO, dash);
+        let (com, _) = controller::centre_of_mass(&w, &r);
+        let sf: Vector = out.forces.iter().map(|(_, f)| *f).sum();
+        let st: Vector = out.forces.iter().map(|(p, f)| (*p - com).cross(*f)).sum();
+        println!("{name:6} want {:>7.0} {:>7.0} {:>7.0} | got {:>7.0} {:>7.0} {:>7.0} | torque {:>7.0} {:>7.0} {:>7.0} N·m",
+            fd.x, fd.y, fd.z, sf.x, sf.y, sf.z, st.x, st.y, st.z);
+    }
+}
+
 fn thrust_demo(build: &str, policy_path: &str, out: &str) {
     let txt = fs::read_to_string(policy_path).expect("policy");
     let mut net = match serde_json::from_str::<ppo::GaussPolicy>(&txt) {
@@ -1001,6 +1019,7 @@ fn main() {
         Some("diag") => diag(),
         Some("runreport") => run_report(),
         Some("evaldistill") => eval_distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
+        Some("thrustcheck") => thrust_check(&a(2).unwrap()),
         Some("thrustdemo") => thrust_demo(&a(2).unwrap(), &a(3).unwrap(), &a(4).unwrap()),
         Some("pose") => pose(&a(2).unwrap(), &a(3).unwrap(), a(4).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
         Some("ppospeed") => ppo_train_mode(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(1000), &a(4).unwrap(), true,
