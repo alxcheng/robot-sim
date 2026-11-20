@@ -947,8 +947,8 @@ fn thrust_check(build: &str) {
     let (w, r) = sim::build_world(&sc);
     for (name, dir, dash) in [("L", [1.0, 0.0, 0.0], false), ("F", [0.0, 0.0, 1.0], false), ("B", [0.0, 0.0, -1.0], false),
         ("U", [0.0, 1.0, 0.0], false), ("dashF", [0.0, 0.0, 1.0], true), ("dashL", [1.0, 0.0, 0.0], true)] {
-        let fd = thrust::desired_force(&r, 0.0, dir, dash);
-        let out = thrust::allocate(&w, &r, fd, Vector::ZERO, dash);
+        let fd = thrust::desired_force(&r, 0.0, dir, if dash { 1.0 } else { 0.0 });
+        let out = thrust::allocate(&w, &r, fd, Vector::ZERO, if dash { 1.0 } else { 0.0 });
         let (com, _) = controller::centre_of_mass(&w, &r);
         let sf: Vector = out.forces.iter().map(|(_, f)| *f).sum();
         let st: Vector = out.forces.iter().map(|(p, f)| (*p - com).cross(*f)).sum();

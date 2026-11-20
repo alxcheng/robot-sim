@@ -10,6 +10,7 @@
 //!
 //! solved by projected gradient descent (9 thrusters × 3 = 27 variables; ~60 iterations per tick).
 
+use crate::DT;
 use crate::controller::*;
 use crate::robot::*;
 use rapier3d::prelude::*;
@@ -21,11 +22,12 @@ pub struct ThrustOut {
 
 /// Desired force (N, world frame) for a heading-frame thrust command and dash flag.
 /// `input`: [left, up, forward] in −1..1. Up = 1 lifts with 1.3 g; horizontal = 1 is 4 m/s².
-pub fn desired_force(r: &Robot, yaw: f32, input: [f32; 3], dash: bool) -> Vector {
+/// `dash` is the dash level 0..1 (it spools up and down like the thrust).
+pub fn desired_force(r: &Robot, yaw: f32, input: [f32; 3], dash: f32) -> Vector {
     let m = r.total_mass;
     let g = 9.81;
-    let horiz = if dash { 15.0 } else { 4.0 };
-    let up = if dash { 2.0 } else { 1.3 };
+    let horiz = 4.0 + 11.0 * dash;
+    let up = 1.3 + 0.7 * dash;
     let h = Rotation::from_rotation_y(yaw) * Vector::new(input[0] * horiz * m, 0.0, input[2] * horiz * m);
     // Horizontal boosting also carries part of the weight (skimming), so the feet aren't dragged
     // sideways under full load; lift scales with how hard the horizontal input is.
@@ -35,7 +37,7 @@ pub fn desired_force(r: &Robot, yaw: f32, input: [f32; 3], dash: bool) -> Vector
     h + Vector::new(0.0, v, 0.0)
 }
 
-pub fn allocate(w: &PhysicsWorld, r: &Robot, f_des: Vector, tau_des: Vector, dash: bool) -> ThrustOut {
+pub fn allocate(w: &PhysicsWorld, r: &Robot, f_des: Vector, tau_des: Vector, dash: f32) -> ThrustOut {
     let (com, _) = centre_of_mass(w, r);
     let n = r.thrusters.len();
     let mut pos = Vec::with_capacity(n);
@@ -46,7 +48,7 @@ pub fn allocate(w: &PhysicsWorld, r: &Robot, f_des: Vector, tau_des: Vector, das
         let rot = *b.rotation();
         pos.push(b.translation() + rot * t.local_pos);
         dir.push((rot * t.local_dir).normalize());
-        fmax.push(if dash { t.dash_force } else { t.max_force });
+        fmax.push(t.max_force + (t.dash_force - t.max_force) * dash);
     }
     let arm: Vec<Vector> = pos.iter().map(|p| *p - com).collect();
     let w_tau = 1.0f32;
@@ -94,12 +96,37 @@ pub fn attitude_torque(w: &PhysicsWorld, r: &Robot, strength: f32, heading: f32)
     Rotation::from_rotation_y(yaw) * tau_h
 }
 
+/// Engine spool state: thrust ramps up in ~0.1 s and down in ~0.35 s instead of switching instantly
+/// (an instant cut dropped the boost's lift in one tick and buckled the legs).
+#[derive(Clone, Copy, Default)]
+pub struct Spool {
+    pub thr: [f32; 3],
+    pub dash: f32,
+}
+
+impl Spool {
+    pub fn update(&mut self, cmd: &Command) {
+        let toward = |x: &mut f32, target: f32, up_s: f32, down_s: f32| {
+            let rate = if target.abs() > x.abs() { DT / up_s } else { DT / down_s };
+            *x += (target - *x).clamp(-rate, rate);
+        };
+        for i in 0..3 {
+            toward(&mut self.thr[i], cmd.thrust[i], 0.1, 0.35);
+        }
+        toward(&mut self.dash, if cmd.dash { 1.0 } else { 0.0 }, 0.05, 0.25);
+    }
+    pub fn active(&self) -> bool {
+        self.thr.iter().any(|v| v.abs() > 1e-3) || self.dash > 1e-3
+    }
+}
+
 /// Apply thrusters for a command. Returns the applied forces for recording.
-pub fn apply(w: &mut PhysicsWorld, r: &Robot, cmd: &Command) -> Vec<(Vector, Vector)> {
+pub fn apply(w: &mut PhysicsWorld, r: &Robot, cmd: &Command, spool: &mut Spool) -> Vec<(Vector, Vector)> {
     if r.thrusters.is_empty() {
         return Vec::new();
     }
-    let active = cmd.thrust.iter().any(|v| v.abs() > 1e-3) || cmd.dash;
+    spool.update(cmd);
+    let active = spool.active();
     // Clear last tick's thruster forces on their mount bodies.
     let mut bodies: Vec<RigidBodyHandle> = r.thrusters.iter().map(|t| t.body).collect();
     bodies.sort_by_key(|h| h.into_raw_parts());
@@ -112,9 +139,9 @@ pub fn apply(w: &mut PhysicsWorld, r: &Robot, cmd: &Command) -> Vec<(Vector, Vec
         return Vec::new();
     }
     let yaw = yaw_of(w.bodies[r.trunk].rotation());
-    let f_des = desired_force(r, yaw, cmd.thrust, cmd.dash);
+    let f_des = desired_force(r, yaw, spool.thr, spool.dash);
     let tau = attitude_torque(w, r, 1.0, cmd.heading);
-    let out = allocate(w, r, f_des, tau, cmd.dash);
+    let out = allocate(w, r, f_des, tau, spool.dash);
     for (t, (p, f)) in r.thrusters.iter().zip(&out.forces) {
         w.bodies[t.body].add_force_at_point(*f, *p, true);
     }
