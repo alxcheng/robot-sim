@@ -193,10 +193,10 @@ pub fn apply(w: &mut PhysicsWorld, r: &Robot, cmd: &Command, spool: &mut Spool, 
         f_des.y = f_des.y.max(brake_force(r, com_v.y));
     }
     if h_brake {
-        // Up to 6 m/s² of deceleration, proportional to the excess speed.
+        // Up to 10 m/s² (1 g) of deceleration, proportional to the excess speed.
         let m = r.total_mass;
-        let a_l = (-4.0 * excess_l).clamp(-6.0, 6.0);
-        let a_f = (4.0 * excess_b).clamp(0.0, 6.0);
+        let a_l = (-6.0 * excess_l).clamp(-10.0, 10.0);
+        let a_f = (6.0 * excess_b).clamp(0.0, 10.0);
         f_des += Rotation::from_rotation_y(yaw0) * Vector::new(a_l * m, 0.0, a_f * m);
     }
     let tau = attitude_torque(w, r, 1.0, cmd.heading);
