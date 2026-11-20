@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."
 build="${1:-GL}"
 final="${2:-1500}"
 dir="out/ppospeed_${build}"
+if [ -f "$dir/DONE" ]; then echo "finished (DONE marker)"; exit 0; fi
 if pgrep -f "walker_lab ppospeed ${build}" >/dev/null; then
   echo "running: $(tail -1 "out/ppospeed_${build}.log" | cut -c1-60)"
   exit 0
