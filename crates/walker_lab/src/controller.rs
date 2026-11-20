@@ -68,6 +68,10 @@ pub struct Command {
     pub heading: f32,
     /// Sideways speed in the heading frame (m/s); positive = left.
     pub lateral: f32,
+    /// Thruster input in the heading frame: [left, up, forward], each −1..1.
+    pub thrust: [f32; 3],
+    /// Dash: short high-thrust burst in the thrust input's direction.
+    pub dash: bool,
 }
 
 pub struct Controller {

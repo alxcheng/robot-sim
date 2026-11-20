@@ -78,6 +78,9 @@ pub struct Frame {
     /// Toe-down angle of each foot (deg) and whether it is on the ground.
     pub toe: [f32; 2],
     pub contact: [bool; 2],
+    /// Active thrusters: world position and force in kN.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub thr: Vec<[f32; 6]>,
 }
 
 #[derive(Serialize)]
@@ -131,7 +134,8 @@ pub fn command_at(sc: &Scenario, t: f32) -> Command {
         }
     }
     let a = ((t - t0) / 1.5).clamp(0.0, 1.0);
-    Command { speed: prev.speed + (cur.speed - prev.speed) * a, heading: cur.heading, lateral: prev.lateral + (cur.lateral - prev.lateral) * a }
+    Command { speed: prev.speed + (cur.speed - prev.speed) * a, heading: cur.heading, lateral: prev.lateral + (cur.lateral - prev.lateral) * a,
+        thrust: cur.thrust, dash: cur.dash }
 }
 
 pub fn run(sc: &Scenario, gait: Gait) -> (Metrics, Option<Recording>) {
@@ -293,6 +297,7 @@ pub fn run_with(sc: &Scenario, mk: &dyn Fn() -> Box<dyn Ctl>) -> (Metrics, Optio
                 feet: tel.feet_in_contact,
                 toe,
                 contact,
+                thr: Vec::new(),
                 label: if t < label_until { label.clone() } else if fallen { "FALL".into() } else { String::new() },
             });
         }
@@ -339,12 +344,17 @@ pub fn run_with(sc: &Scenario, mk: &dyn Fn() -> Box<dyn Ctl>) -> (Metrics, Optio
 // ---------------- scenario library ----------------
 
 pub fn cmd(t: f32, speed: f32, heading: f32) -> (f32, Command) {
-    (t, Command { speed, heading, lateral: 0.0 })
+    (t, Command { speed, heading, lateral: 0.0, ..Default::default() })
+}
+
+/// Command with thruster input [left, up, forward] and optional dash.
+pub fn cmd_t(t: f32, speed: f32, lateral: f32, heading: f32, thrust: [f32; 3], dash: bool) -> (f32, Command) {
+    (t, Command { speed, heading, lateral, thrust, dash })
 }
 
 /// Command with a sideways component (m/s, +left).
 pub fn cmd_l(t: f32, speed: f32, lateral: f32, heading: f32) -> (f32, Command) {
-    (t, Command { speed, heading, lateral })
+    (t, Command { speed, heading, lateral, ..Default::default() })
 }
 
 pub fn scenario(name: &str, assist: f32) -> Scenario {

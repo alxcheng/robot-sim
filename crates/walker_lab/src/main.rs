@@ -12,6 +12,7 @@ mod policy;
 mod ppo;
 mod robot;
 mod robot_v;
+mod thrust;
 mod run_ctl;
 mod sim;
 
@@ -216,6 +217,14 @@ fn build_spec(name: &str) -> robot::RobotSpec {
             legs: LegKind::Deer, foot_scale: 1.0, swing_arms: true, reaction_wheels: true, arm_dof: 3,
             frame: robot::Frame::MechV, strength: 1.3,
             load: match name { "GL" => robot::Load::Light, "GM" => robot::Load::Medium, _ => robot::Load::Heavy },
+            thrusters: false,
+        },
+        // Same builds with the 9-thruster set.
+        "GLT" | "GMT" | "GHT" => RobotSpec {
+            legs: LegKind::Deer, foot_scale: 1.0, swing_arms: true, reaction_wheels: true, arm_dof: 3,
+            frame: robot::Frame::MechV, strength: 1.3,
+            load: match name { "GLT" => robot::Load::Light, "GMT" => robot::Load::Medium, _ => robot::Load::Heavy },
+            thrusters: true,
         },
         _ => panic!("unknown build {name}"),
     }
@@ -879,6 +888,57 @@ fn pose(build: &str, out: &str, twist: f32) {
     fs::write(out, serde_json::to_string(&rec).unwrap()).unwrap();
 }
 
+/// Thruster demo: legs run the given policy while the thrusters follow a scripted input sequence.
+fn thrust_demo(build: &str, policy_path: &str, out: &str) {
+    let txt = fs::read_to_string(policy_path).expect("policy");
+    let mut net = match serde_json::from_str::<ppo::GaussPolicy>(&txt) {
+        Ok(p) => p.net,
+        Err(_) => serde_json::from_str::<policy::Mlp>(&txt).unwrap(),
+    };
+    net.expand_inputs(policy::OBS_DIM);
+    let gait = load_run_gait("GL", 0.0);
+    let mut sc = scenario("run_mid", 0.0);
+    sc.spec = build_spec(build);
+    sc.duration = 13.0;
+    sc.commands = vec![
+        cmd(0.0, 2.0, 0.0),
+        cmd_t(2.0, 1.0, 0.0, 0.0, [1.0, 0.0, 0.0], false),   // strafe left on thrust
+        cmd_t(3.5, 1.0, 0.0, 0.0, [0.0, 0.0, 0.0], false),
+        cmd_t(4.0, 2.5, 0.0, 0.0, [0.0, 0.0, 1.0], true),    // dash forward
+        cmd_t(4.35, 3.0, 0.0, 0.0, [0.0, 0.0, 0.0], false),
+        cmd_t(6.0, 1.5, 0.0, 0.0, [0.0, 1.0, 0.0], false),   // thrust up
+        cmd_t(7.0, 1.0, 0.0, 0.0, [0.0, 0.0, 0.0], false),
+        cmd_t(8.0, 0.0, 0.0, 0.0, [0.0, 0.0, -1.0], false),  // thrust backwards
+        cmd_t(9.5, 0.5, 0.0, 0.0, [0.0, 0.0, 0.0], false),
+        cmd_t(10.0, 0.5, 0.0, 0.0, [-1.0, 0.0, 0.0], true),  // dash right
+        cmd_t(10.35, 1.0, 0.0, 0.0, [0.0, 0.0, 0.0], false),
+    ];
+    let labels = [(2.0, "THRUST LEFT"), (4.0, "DASH FORWARD"), (6.0, "THRUST UP"), (8.0, "THRUST BACK"), (10.0, "DASH RIGHT")];
+    let cfg = ppo::RewardCfg { stride_target: 1.8, vmax: 7.0, speed_mode: true, omni: true, knock_dv: 3.0 };
+    let mut env = ppo::Env::with(sc.spec, gait, sc.clone(), ppo::EpMode::Omni, 0.0);
+    env.frames = Some(Vec::new());
+    let mut fell_at = None;
+    let mut max_h: f32 = 0.0;
+    while env.t() < sc.duration {
+        env.label = labels.iter().rev().find(|(t, _)| env.t() >= *t && env.t() < *t + 1.5).map(|l| l.1.to_string()).unwrap_or_default();
+        let o = env.obs();
+        let a = net.forward_norm(&o);
+        let (_, term, _) = env.step(&net, &a, cfg);
+        let (vf, vl, _) = env.velocity();
+        if (env.t() * 60.0).round() as i32 % 30 == 0 {
+            println!("t {:5.2} fwd {:+.2} left {:+.2} {}", env.t(), vf, vl, env.label);
+        }
+        max_h = max_h.max(env.frames.as_ref().unwrap().last().map(|f| f.b[0][1]).unwrap_or(0.0));
+        if term && fell_at.is_none() {
+            fell_at = Some(env.t());
+            println!("fell at {:.2}", env.t());
+            break;
+        }
+    }
+    println!("max pelvis height {max_h:.2} m");
+    save_clip(&env, out, &format!("THRUSTERS · build {build}"));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let a = |i: usize| args.get(i).cloned();
@@ -903,6 +963,7 @@ fn main() {
         Some("diag") => diag(),
         Some("runreport") => run_report(),
         Some("evaldistill") => eval_distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
+        Some("thrustdemo") => thrust_demo(&a(2).unwrap(), &a(3).unwrap(), &a(4).unwrap()),
         Some("pose") => pose(&a(2).unwrap(), &a(3).unwrap(), a(4).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
         Some("ppospeed") => ppo_train_mode(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(1000), &a(4).unwrap(), true,
             a(5).map(|s| s.parse().unwrap()), a(6).map(|s| s.parse().unwrap()).unwrap_or(0), false),

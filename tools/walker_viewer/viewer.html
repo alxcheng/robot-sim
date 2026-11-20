@@ -25,7 +25,7 @@ const COLORS = {
   thigh: 0x8e99a4, shin: 0x8e99a4, meta: 0x7a8591, foot: 0x4b5560, hoof: 0x3a4250, forearm: 0x7f8a95, gimbal: 0x2a323a, wheel: 0x5a6570,
   v_pelvis: 0x6c7782, v_chest: 0xb8c1c9, v_thigh: 0x7c8792, v_shin: 0xa3adb7, v_meta: 0x95a0aa, v_forearm: 0x9aa4ae,
   v_pauldron: 0xc2cad1, ball: 0x3c4651, pack: 0x5d6873, armor: 0xaeb8c1, weapon: 0x3a434d,
-  hinge_x: 0x343d47, hinge_y: 0x343d47, pyramid: 0xd0d7dd, v_groin: 0x5a6570,
+  hinge_x: 0x343d47, hinge_y: 0x343d47, pyramid: 0xd0d7dd, v_groin: 0x5a6570, thruster: 0x2b3138,
 };
 function shapeGeometry(s) {
   if (s.kind === 'ball') return new THREE.SphereGeometry(s.half[0], 20, 14);
@@ -141,6 +141,10 @@ function init(width, height) {
         if (ax === 'x') ring.rotation.y = Math.PI / 2;
         ring.position.set(...s.offset); g.add(ring);
       }
+      if (s.tag === 'thruster') {
+        const ring = new THREE.Mesh(new THREE.BoxGeometry(s.half[0] * 2.1, s.half[1] * 0.5, s.half[2] * 2.1), new THREE.MeshBasicMaterial({ color: 0xe3a42c }));
+        ring.position.set(...s.offset); g.add(ring);
+      }
       if (s.tag === 'weapon') {
         const muzzle = new THREE.Mesh(new THREE.BoxGeometry(s.half[0] * 1.2, 0.05, s.half[2] * 1.2), new THREE.MeshBasicMaterial({ color: 0xe3a42c }));
         muzzle.position.set(s.offset[0], s.offset[1] - s.half[1] - 0.026, s.offset[2]); g.add(muzzle);
@@ -171,6 +175,18 @@ function show(i) {
   camera.position.copy(camPos); camera.lookAt(camTarget);
   sun.position.set(target.x - 6, 14, target.z + 6); sun.target.position.copy(target);
 
+  // Thruster flames: exhaust points opposite the force; length grows with force (kN).
+  if (window.flames) window.flames.forEach(a => scene.remove(a));
+  window.flames = [];
+  for (const t of (f.thr || [])) {
+    const F = new THREE.Vector3(t[3], t[4], t[5]);
+    const kn = F.length();
+    if (kn < 0.05) continue;
+    const dir = F.clone().normalize().negate();
+    const len = 0.25 + 0.07 * kn;
+    const a = new THREE.ArrowHelper(dir, new THREE.Vector3(t[0], t[1], t[2]), len, 0xffb347, Math.min(0.35, len * 0.45), 0.2);
+    scene.add(a); window.flames.push(a);
+  }
   // Push arrow for 0.6 s after each push.
   if (arrow) { scene.remove(arrow); arrow = null; }
   for (const p of REC.pushes) {

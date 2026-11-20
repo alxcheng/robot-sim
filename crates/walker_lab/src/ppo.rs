@@ -88,6 +88,7 @@ pub struct Env {
     pub first_stand_t: Option<f32>,
     pub frames: Option<Vec<crate::sim::Frame>>,
     pub label: String,
+    last_thrust: Vec<(Vector, Vector)>,
 }
 
 fn random_scenario(spec: RobotSpec, rng: &mut Rng, dur: f32, vmax: f32) -> Scenario {
@@ -164,7 +165,7 @@ impl Env {
         Env {
             w, r, sc, t: 0.0, tracker: Default::default(), gait, prev_a: vec![0.0; ACTION_DIM],
             last_td: None, foot_prev: [true; 2], toe_peak: [0.0; 2], ep_return: 0.0, track_sum: 0.0, track_n: 0.0, cmd_sum: 0.0, last_td_t: -1.0,
-            mode, knock_dir, stood_s: 0.0, first_stand_t: None, frames: None, label: String::new(),
+            mode, knock_dir, stood_s: 0.0, first_stand_t: None, frames: None, label: String::new(), last_thrust: Vec::new(),
         }
     }
 
@@ -202,6 +203,7 @@ impl Env {
             frames.push(crate::sim::Frame {
                 t: self.t, b, speed: tel.fwd_speed, cmd_speed: cmdv.speed, heading: tel.yaw, cmd_heading: cmdv.heading,
                 label: self.label.clone(), feet: tel.feet_in_contact, toe: [0.0; 2], contact: c,
+                thr: self.last_thrust.iter().filter(|(_, f)| f.length() > 50.0).map(|(p, f)| [p.x, p.y, p.z, f.x / 1000.0, f.y / 1000.0, f.z / 1000.0]).collect(),
             });
         }
     }
@@ -238,6 +240,7 @@ impl Env {
                 trunk.add_force(dv * self.r.total_mass / 0.1, true);
             }
         }
+        self.last_thrust = crate::thrust::apply(&mut self.w, &self.r, &cmdv);
         self.w.step();
         self.t += DT;
         let c = [foot_in_contact(&self.w, &self.r.legs[0]), foot_in_contact(&self.w, &self.r.legs[1])];

@@ -63,6 +63,9 @@ pub struct RobotSpec {
     /// Leg/arm actuator strength relative to "sized for this body weight" (mech-V frame only).
     #[serde(default = "one_f")]
     pub strength: f32,
+    /// Fit the 9-thruster set (mech-V frame only).
+    #[serde(default)]
+    pub thrusters: bool,
 }
 
 fn one_f() -> f32 {
@@ -95,7 +98,7 @@ fn one() -> u8 {
 
 impl Default for RobotSpec {
     fn default() -> Self {
-        RobotSpec { legs: LegKind::Biped, foot_scale: 1.0, swing_arms: false, reaction_wheels: false, arm_dof: 1, frame: Frame::Classic, load: Load::Light, strength: 1.0 }
+        RobotSpec { legs: LegKind::Biped, foot_scale: 1.0, swing_arms: false, reaction_wheels: false, arm_dof: 1, frame: Frame::Classic, load: Load::Light, strength: 1.0, thrusters: false }
     }
 }
 
@@ -169,6 +172,7 @@ pub fn shape_style(tag: &str) -> (&'static str, [f32; 2]) {
         // Pyramid: base rectangle ±half[0] × ±half[1] at local z = 0, apex at z = half[2].
         "pyramid" => ("pyramid", [1.0, 1.0]),
         "v_groin" => ("box", [1.0, 0.6]),
+        "thruster" => ("box", [1.0, 1.0]),
         // Chest: tapered box whose front face rises to a point (pyramid on the front-face corners).
         "v_chest" => ("chest", [1.0, 0.55]),
         "v_pelvis" => ("box", [1.0, 0.75]),
@@ -215,8 +219,24 @@ pub struct Arm {
     pub elbow: Option<(MultibodyJointHandle, RigidBodyHandle)>,
 }
 
+/// A gimballed thruster: pushes its mount body along a force direction that may swing up to
+/// `cone` radians from its nominal direction (π/2 = a 180° hemisphere).
+#[derive(Clone, Debug)]
+pub struct Thruster {
+    pub name: &'static str,
+    pub body: RigidBodyHandle,
+    /// Mount point and nominal force direction in the mount body's frame.
+    pub local_pos: Vector,
+    pub local_dir: Vector,
+    pub cone: f32,
+    /// Sustained and dash (short burst) force limits (N).
+    pub max_force: f32,
+    pub dash_force: f32,
+}
+
 pub struct Robot {
     pub spec: RobotSpec,
+    pub thrusters: Vec<Thruster>,
     pub trunk: RigidBodyHandle,
     pub legs: [Leg; 2],
     pub arms: Option<[Arm; 2]>,
@@ -477,7 +497,7 @@ pub fn build(w: &mut PhysicsWorld, origin: Vector, spec: RobotSpec) -> Robot {
     }
 
     let total_mass = links.iter().map(|l| w.bodies[l.body].mass()).sum();
-    Robot { spec, trunk, legs: [left, right], arms, wheels, links, total_mass, waist: None, motor_scale: 1.0 }
+    Robot { spec, thrusters: Vec::new(), trunk, legs: [left, right], arms, wheels, links, total_mass, waist: None, motor_scale: 1.0 }
 }
 
 /// Update one joint's position motor. `g.kp` scales the joint's base stiffness; `g.kd` is damping

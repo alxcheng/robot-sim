@@ -68,10 +68,32 @@ pub fn build_v(w: &mut PhysicsWorld, o: Vector, spec: RobotSpec) -> Robot {
         p([0.07 * k, 0.04, 0.07 * k], [0.0, chest_half[1] + 0.04, 0.02], 5.0, "torso"),
         p([0.10, 0.11, 0.13], [0.0, chest_half[1] + 0.08 + 0.11, 0.05], 30.0, "head"),
     ];
+    let pack_depth = match spec.load {
+        Load::Light => 0.0,
+        Load::Medium => 0.28,
+        Load::Heavy => 0.40,
+    };
     match spec.load {
         Load::Light => {}
         Load::Medium => upper_parts.push(p([0.30, 0.28, 0.14], [0.0, 0.04, -chest_half[2] - 0.15], 140.0, "pack")),
         Load::Heavy => upper_parts.push(p([0.44, 0.34, 0.20], [0.0, 0.06, -chest_half[2] - 0.21], 260.0, "pack")),
+    }
+    // Thruster mounts on the upper body: (name, local position, nominal force direction, half-size, mass, max force at reference weight).
+    let apex_z = chest_half[2] * 0.5 * (1.0 + 0.55) + 0.55 * chest_half[2];
+    let socket_c = socket_inner + 0.04;
+    let upper_thr: Vec<(&'static str, [f32; 3], [f32; 3], [f32; 3], f32, f32)> = if spec.thrusters {
+        vec![
+            ("shoulder_L", [socket_c, shoulder_y - upper_y + 0.10 * kn + 0.08, 0.0], [0.0, 1.0, 0.0], [0.06, 0.07, 0.08], 30.0, 9_000.0),
+            ("shoulder_R", [-socket_c, shoulder_y - upper_y + 0.10 * kn + 0.08, 0.0], [0.0, 1.0, 0.0], [0.06, 0.07, 0.08], 30.0, 9_000.0),
+            ("back_L", [0.20 * k, 0.10, -chest_half[2] - pack_depth - 0.09], [0.0, 0.0, 1.0], [0.07, 0.09, 0.08], 30.0, 6_000.0),
+            ("back_R", [-0.20 * k, 0.10, -chest_half[2] - pack_depth - 0.09], [0.0, 0.0, 1.0], [0.07, 0.09, 0.08], 30.0, 6_000.0),
+            ("chest", [0.0, 0.0, apex_z + 0.08], [0.0, 0.0, -1.0], [0.11, 0.11, 0.10], 60.0, 10_000.0),
+        ]
+    } else {
+        vec![]
+    };
+    for (_, pos, _, half, m, _) in &upper_thr {
+        upper_parts.push(p(*half, *pos, *m, "thruster"));
     }
     let (upper, _) = add_body(w, &mut links, "upper_body".into(), upper_pos, &upper_parts, true);
     let wj = revolute(w, pelvis, upper, Vector::Y, Vector::new(0.0, waist_y - pelvis_y, 0.0), Vector::new(0.0, waist_y - upper_y, 0.0), Some([-0.8, 0.8]), MAX_TORQUE[WAIST]);
@@ -91,13 +113,25 @@ pub fn build_v(w: &mut PhysicsWorld, o: Vector, spec: RobotSpec) -> Robot {
         let j0 = revolute(w, pelvis, yg, Vector::Y, hip - pelvis_pos, z, Some([-0.5, 0.5]), MAX_TORQUE[HIP_YAW]);
         let j1 = revolute(w, yg, rg, Vector::Z, z, z, Some([-0.6, 0.6]), MAX_TORQUE[HIP_ROLL]);
         let (cy, hh) = span(hip_y - r_hip - GAP, knee_y + r_knee + GAP);
-        let (thb, _) = add_body(w, links, format!("{n}_thigh"), at(x, cy, 0.0), &[p(th([0.11, hh, 0.14]), [0.0; 3], 240.0 * km, "v_thigh")], true);
+        let thigh_half = th([0.11, hh, 0.14]);
+        let mut thigh_parts = vec![p(thigh_half, [0.0; 3], 240.0 * km, "v_thigh")];
+        let thigh_thr = [0.0, 0.0, -thigh_half[2] * 1.0 - GAP - 0.07];
+        if spec.thrusters {
+            thigh_parts.push(p([0.06, 0.08, 0.07], thigh_thr, 30.0, "thruster"));
+        }
+        let (thb, _) = add_body(w, links, format!("{n}_thigh"), at(x, cy, 0.0), &thigh_parts, true);
         let j2 = revolute(w, rg, thb, Vector::X, z, Vector::new(0.0, hip_y - cy, 0.0), Some([-1.8, 1.0]), MAX_TORQUE[HIP_PITCH]);
         let (cy2, hh2) = span(knee_y - r_knee - GAP, hock_y + r_hock + GAP);
-        let (sh, _) = add_body(w, links, format!("{n}_shin"), at(x, cy2, 0.0), &[
-            p(th([0.16, hh2, 0.19]), [0.0; 3], 180.0 * km, "v_shin"),
+        let shin_half = th([0.16, hh2, 0.19]);
+        let knee_thr = [0.0, hh2 - 0.10, shin_half[2] * 1.0 + GAP + 0.06];
+        let mut shin_parts = vec![
+            p(shin_half, [0.0; 3], 180.0 * km, "v_shin"),
             p([r_knee, 0.15 * k, r_knee], [0.0, knee_y - cy2, 0.0], 10.0, "hinge_x"),
-        ], true);
+        ];
+        if spec.thrusters {
+            shin_parts.push(p([0.07, 0.07, 0.06], knee_thr, 30.0, "thruster"));
+        }
+        let (sh, _) = add_body(w, links, format!("{n}_shin"), at(x, cy2, 0.0), &shin_parts, true);
         let j3 = revolute(w, thb, sh, Vector::X, Vector::new(0.0, knee_y - cy, 0.0), Vector::new(0.0, knee_y - cy2, 0.0), Some([-0.02, 2.4]), MAX_TORQUE[KNEE]);
         let (cy3, hh3) = span(hock_y - r_hock - GAP, ankle_y + r_ankle + GAP);
         let (mt, _) = add_body(w, links, format!("{n}_meta"), at(x, cy3, 0.0), &[
@@ -182,5 +216,21 @@ pub fn build_v(w: &mut PhysicsWorld, o: Vector, spec: RobotSpec) -> Robot {
 
     let total_mass: f32 = links.iter().map(|l| w.bodies[l.body].mass()).sum();
     let motor_scale = spec.strength * total_mass / 3560.0;
-    Robot { spec, trunk: pelvis, legs: [left, right], arms, wheels, links, total_mass, waist: Some((wj, upper)), motor_scale }
+    // Thrust scales with weight (forces listed for a 2.1 t frame), like the motors.
+    let fscale = total_mass / 2087.0;
+    let mut thrusters = Vec::new();
+    if spec.thrusters {
+        let v = |a: [f32; 3]| Vector::new(a[0], a[1], a[2]);
+        for (name, pos, dir, _, _, f) in &upper_thr {
+            thrusters.push(Thruster { name, body: upper, local_pos: v(*pos), local_dir: v(*dir), cone: std::f32::consts::FRAC_PI_2, max_force: f * fscale, dash_force: 2.5 * f * fscale });
+        }
+        for (i, leg) in [&left, &right].iter().enumerate() {
+            let (tn, kn_) = if i == 0 { ("thigh_L", "knee_L") } else { ("thigh_R", "knee_R") };
+            let tz = -0.14 * k - GAP - 0.07;
+            thrusters.push(Thruster { name: tn, body: leg.bodies[B_THIGH], local_pos: Vector::new(0.0, 0.0, tz), local_dir: Vector::Z, cone: std::f32::consts::FRAC_PI_2, max_force: 4_000.0 * fscale, dash_force: 10_000.0 * fscale });
+            let (_, hh2) = span(knee_y - r_knee - GAP, hock_y + r_hock + GAP);
+            thrusters.push(Thruster { name: kn_, body: leg.bodies[B_SHIN], local_pos: Vector::new(0.0, hh2 - 0.10, 0.19 * k + GAP + 0.06), local_dir: -Vector::Z, cone: std::f32::consts::FRAC_PI_2, max_force: 4_000.0 * fscale, dash_force: 10_000.0 * fscale });
+        }
+    }
+    Robot { spec, thrusters, trunk: pelvis, legs: [left, right], arms, wheels, links, total_mass, waist: Some((wj, upper)), motor_scale }
 }
