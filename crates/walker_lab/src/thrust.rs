@@ -117,11 +117,25 @@ pub fn attitude_torque(w: &PhysicsWorld, r: &Robot, strength: f32, heading: f32)
 
 /// Engine spool state: thrust ramps up in ~0.1 s and down in ~0.35 s instead of switching instantly
 /// (an instant cut dropped the boost's lift in one tick and buckled the legs).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct Spool {
     pub thr: [f32; 3],
     pub dash: f32,
+    /// Seconds since the thrusters last fired on input (large = long ago).
+    pub since_active: f32,
 }
+
+impl Default for Spool {
+    fn default() -> Self {
+        Self { thr: [0.0; 3], dash: 0.0, since_active: 99.0 }
+    }
+}
+
+/// Sideways and backward speeds the legs can handle; above these the post-boost brake bleeds speed.
+pub const SAFE_SIDE: f32 = 1.5;
+pub const SAFE_BACK: f32 = 2.0;
+/// How long after a boost the brake stays armed (s).
+pub const BRAKE_WINDOW: f32 = 2.0;
 
 impl Spool {
     /// `k` scales the dash level (thrust curriculum); the thrust input arrives already scaled.
@@ -134,6 +148,7 @@ impl Spool {
             toward(&mut self.thr[i], cmd.thrust[i], 0.1, 0.35);
         }
         toward(&mut self.dash, if cmd.dash { k } else { 0.0 }, 0.05, 0.25);
+        self.since_active = if self.active() { 0.0 } else { (self.since_active + DT).min(99.0) };
     }
     pub fn active(&self) -> bool {
         self.thr.iter().any(|v| v.abs() > 1e-3) || self.dash > 1e-3
@@ -150,7 +165,15 @@ pub fn apply(w: &mut PhysicsWorld, r: &Robot, cmd: &Command, spool: &mut Spool, 
     let airborne = !foot_in_contact(w, &r.legs[0]) && !foot_in_contact(w, &r.legs[1]);
     // Automatic soft landing: falling faster than SAFE_DESCENT with no foot down fires the thrusters.
     let braking = airborne && com_v.y < -SAFE_DESCENT + 0.5;
-    let active = spool.active() || braking;
+    // Post-boost brake: for a moment after the thrusters fire, with no horizontal input held, bleed
+    // sideways/backward speed the legs can't run off (a side dash leaves ~6 m/s of slide).
+    let yaw0 = yaw_of(w.bodies[r.trunk].rotation());
+    let vh = Rotation::from_rotation_y(-yaw0) * com_v;
+    let no_h_input = spool.thr[0].abs() < 1e-3 && spool.thr[2].abs() < 1e-3 && spool.dash < 1e-3;
+    let excess_l = vh.x.signum() * (vh.x.abs() - SAFE_SIDE).max(0.0);
+    let excess_b = (-vh.z - SAFE_BACK).max(0.0);
+    let h_brake = spool.since_active < BRAKE_WINDOW && no_h_input && (excess_l != 0.0 || excess_b > 0.0);
+    let active = spool.active() || braking || h_brake;
     // Clear last tick's thruster forces on their mount bodies.
     let mut bodies: Vec<RigidBodyHandle> = r.thrusters.iter().map(|t| t.body).collect();
     bodies.sort_by_key(|h| h.into_raw_parts());
@@ -168,6 +191,13 @@ pub fn apply(w: &mut PhysicsWorld, r: &Robot, cmd: &Command, spool: &mut Spool, 
     let mut f_des = desired_force(r, yaw, spool.thr, spool.dash, com_v.y);
     if braking {
         f_des.y = f_des.y.max(brake_force(r, com_v.y));
+    }
+    if h_brake {
+        // Up to 6 m/s² of deceleration, proportional to the excess speed.
+        let m = r.total_mass;
+        let a_l = (-4.0 * excess_l).clamp(-6.0, 6.0);
+        let a_f = (4.0 * excess_b).clamp(0.0, 6.0);
+        f_des += Rotation::from_rotation_y(yaw0) * Vector::new(a_l * m, 0.0, a_f * m);
     }
     let tau = attitude_torque(w, r, 1.0, cmd.heading);
     let out = allocate(w, r, f_des, tau, spool.dash);
