@@ -145,10 +145,10 @@ impl Env {
             - 0.002 * smooth;
         let speed_gate = (-v_err * v_err / (tol * 1.6)).exp();
         let stride_target = if cfg.speed_mode { (cmdv.speed / 2.2).max(0.6) } else { cfg.stride_target };
-        let push_w = if cfg.speed_mode { 4.0 } else { 1.0 };
+        let push_w = if cfg.speed_mode { 10.0 } else { 1.0 };
         // Bounding: reward airborne time (both feet off the ground) while on speed.
         if cfg.speed_mode && !c[0] && !c[1] {
-            rew += 0.3 * speed_gate;
+            rew += 0.6 * speed_gate;
         }
         for k in 0..2 {
             let fb = &self.w.bodies[self.r.legs[k].bodies[B_FOOT]];
@@ -169,7 +169,7 @@ impl Env {
                 if cfg.speed_mode && self.last_td_t >= 0.0 {
                     let interval = self.t - self.last_td_t;
                     if interval < 0.4 {
-                        rew -= 2.0 * (0.4 - interval) / 0.4;
+                        rew -= 25.0 * (0.4 - interval) / 0.4;
                     }
                 }
                 self.last_td_t = self.t;
