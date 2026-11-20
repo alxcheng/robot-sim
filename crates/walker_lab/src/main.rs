@@ -573,7 +573,7 @@ fn ppo_train(build: &str, iters: usize, init: &str) {
 /// Deterministic evaluation episode through the PPO environment (supports knockdowns), optionally recorded.
 fn run_env(build: &str, gait: run_ctl::RunGait, net: &policy::Mlp, sc: Scenario, mode: ppo::EpMode, knock_dir: f32, label: &str, rec: bool)
     -> (ppo::Env, Vec<(f32, f32, f32)>, bool) {
-    let cfg = ppo::RewardCfg { stride_target: 1.8, vmax: 7.0, speed_mode: true, omni: true };
+    let cfg = ppo::RewardCfg { stride_target: 1.8, vmax: 7.0, speed_mode: true, omni: true, knock_dv: 3.0 };
     let dur = sc.duration;
     let mut env = ppo::Env::with(build_spec(build), gait, sc, mode, knock_dir);
     env.label = label.to_string();
@@ -682,7 +682,7 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
     let mut popt = pol.net.adam();
     let mut vopt = value.adam();
     let mut lsopt = (vec![0.0; run_ctl::ACTION_DIM], vec![0.0; run_ctl::ACTION_DIM], 0);
-    let mut cfg = ppo::RewardCfg { stride_target: 1.8, vmax: 3.1, speed_mode, omni };
+    let mut cfg = ppo::RewardCfg { stride_target: 1.8, vmax: 3.1, speed_mode, omni, knock_dv: 1.0 };
     if speed_mode {
         cfg.vmax = vmax0.unwrap_or(3.0);
     }
@@ -748,7 +748,7 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
             let hs: Vec<_> = (0..4).map(|k| s.spawn(move || ppo::rollout(p, v, spec, gait, 6000, (it * 17 + k) as u64 * 1_000_003, cfg))).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        let mut b = ppo::Batch { obs: vec![], act: vec![], logp: vec![], adv: vec![], ret: vec![], ep_returns: vec![], ep_lengths: vec![], ep_track: vec![], ep_cmd: vec![] };
+        let mut b = ppo::Batch { obs: vec![], act: vec![], logp: vec![], adv: vec![], ret: vec![], ep_returns: vec![], ep_lengths: vec![], ep_track: vec![], ep_cmd: vec![], ep_getup: vec![] };
         for x in batches {
             b.obs.extend(x.obs);
             b.act.extend(x.act);
@@ -759,6 +759,7 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
             b.ep_lengths.extend(x.ep_lengths);
             b.ep_track.extend(x.ep_track);
             b.ep_cmd.extend(x.ep_cmd);
+            b.ep_getup.extend(x.ep_getup);
         }
         let roll_s = t0.elapsed().as_secs_f32();
         let lr_pi = if it <= warmup { 0.0 } else { 1e-5 };
@@ -772,6 +773,13 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
         let survive = b.ep_lengths.iter().filter(|l| **l >= 9.9).count() as f32 / ne;
         let top: Vec<f32> = b.ep_track.iter().zip(&b.ep_cmd).filter(|(_, c)| **c >= cfg.vmax - 1.0).map(|(t, _)| *t).collect();
         let top_track = if top.is_empty() { 0.0 } else { top.iter().sum::<f32>() / top.len() as f32 };
+        // Knockdown curriculum: stronger shoves once ≥60% of get-up episodes end standing.
+        let gu: Vec<f32> = b.ep_getup.iter().copied().filter(|v| *v >= 0.0).collect();
+        let gu_rate = if gu.is_empty() { 0.0 } else { gu.iter().sum::<f32>() / gu.len() as f32 };
+        if omni && it > warmup && gu.len() >= 4 && gu_rate >= 0.6 && cfg.knock_dv < 3.0 {
+            cfg.knock_dv = (cfg.knock_dv + 0.5).min(3.0);
+            println!("  >>> knockdown shove raised to {:.1} m/s at iteration {it}", cfg.knock_dv);
+        }
         if speed_mode && !omni && it > warmup {
             if survive >= 0.85 && top_track >= 0.55 { streak += 1 } else { streak = 0 }
             if streak >= 5 && cfg.vmax < 7.5 {
@@ -780,6 +788,9 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
                 vmax_log.push((it, cfg.vmax));
                 println!("  >>> top speed raised to {:.1} m/s at iteration {it}", cfg.vmax);
             }
+        }
+        if omni {
+            print!("[knock {:.1} getup {:.2}] ", cfg.knock_dv, gu_rate);
         }
         println!("iter {it:4}: ep_return {ret:7.1} ep_len {len:4.1}s eps {:3} surv {:.2} top_track {:.2} vmax {:.1} | kl {:.4} clip {:.2} vloss {:.3} std {:.3} | {:.0}s",
             b.ep_returns.len(), survive, top_track, cfg.vmax, st.kl, st.clip_frac, st.v_loss, std_mean, t0.elapsed().as_secs_f32());

@@ -46,6 +46,8 @@ pub struct RewardCfg {
     pub speed_mode: bool,
     /// Mix in omnidirectional jogging and knockdown/get-up episodes.
     pub omni: bool,
+    /// Knockdown shove (m/s of whole-robot velocity); ramped up as get-ups succeed.
+    pub knock_dv: f32,
 }
 
 /// Kind of practice episode.
@@ -209,7 +211,8 @@ impl Env {
         let cmdv = command_at(&self.sc, self.t);
         let real: Vec<f32> = a_norm.iter().enumerate().map(|(i, v)| v * net.out_std[i] + net.out_mean[i]).collect();
         let mut act = Action::from_slice(&real);
-        let knock = self.mode == EpMode::GetUp && self.t >= KNOCK_T && self.t < KNOCK_T + LIMP_S;
+        let limp_s = 0.4 + 0.27 * cfg.knock_dv;
+        let knock = self.mode == EpMode::GetUp && self.t >= KNOCK_T && self.t < KNOCK_T + limp_s;
         if knock {
             // Knocked down: motors go limp briefly.
             for l in 0..2 {
@@ -231,7 +234,7 @@ impl Env {
                 }
             }
             if self.mode == EpMode::GetUp && self.t >= KNOCK_T && self.t < KNOCK_T + 0.1 {
-                let dv = Vector::new(3.0 * self.knock_dir.sin(), 0.0, 3.0 * self.knock_dir.cos());
+                let dv = Vector::new(cfg.knock_dv * self.knock_dir.sin(), 0.0, cfg.knock_dv * self.knock_dir.cos());
                 trunk.add_force(dv * self.r.total_mass / 0.1, true);
             }
         }
@@ -249,7 +252,7 @@ impl Env {
             if !finite {
                 return (-10.0, true, false);
             }
-            if self.t < KNOCK_T + LIMP_S {
+            if self.t < KNOCK_T + limp_s {
                 return (0.0, false, false);
             }
             // Get up: height and uprightness, a bonus for standing, then stand still.
@@ -341,6 +344,8 @@ pub struct Batch {
     /// Per episode: mean speed-tracking score (0..1) and mean commanded speed.
     pub ep_track: Vec<f32>,
     pub ep_cmd: Vec<f32>,
+    /// Get-up episodes: 1 if standing at the end, 0 if not; -1 for other episodes.
+    pub ep_getup: Vec<f32>,
 }
 
 pub fn logp(mu: &[f32], log_std: &[f32], a: &[f32]) -> f32 {
@@ -359,7 +364,7 @@ pub fn rollout(pol: &GaussPolicy, value: &Mlp, spec: RobotSpec, gait: RunGait, s
     let mut env = Env::new(spec, gait, seed, cfg.vmax, cfg.omni);
     let mut episode = 0u64;
     let (mut obs, mut act, mut lp, mut rews, mut vals, mut dones, mut boots) = (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
-    let (mut ep_returns, mut ep_lengths, mut ep_track, mut ep_cmd) = (vec![], vec![], vec![], vec![]);
+    let (mut ep_returns, mut ep_lengths, mut ep_track, mut ep_cmd, mut ep_getup) = (vec![], vec![], vec![], vec![], vec![]);
     for _ in 0..steps {
         let o = env.obs();
         let mu = pol.net.forward_norm(&o);
@@ -380,6 +385,7 @@ pub fn rollout(pol: &GaussPolicy, value: &Mlp, spec: RobotSpec, gait: RunGait, s
             ep_lengths.push(env.t);
             ep_track.push(env.track_sum / env.track_n.max(1.0));
             ep_cmd.push(env.cmd_sum / env.track_n.max(1.0));
+            ep_getup.push(if env.mode == EpMode::GetUp { if env.standing() { 1.0 } else { 0.0 } } else { -1.0 });
             episode += 1;
             env = Env::new(spec, gait, seed.wrapping_add(episode * 7919), cfg.vmax, cfg.omni);
         }
@@ -396,7 +402,7 @@ pub fn rollout(pol: &GaussPolicy, value: &Mlp, spec: RobotSpec, gait: RunGait, s
         adv[t] = gae;
     }
     let ret: Vec<f32> = adv.iter().zip(&vals).map(|(a, v)| a + v).collect();
-    Batch { obs, act, logp: lp, adv, ret, ep_returns, ep_lengths, ep_track, ep_cmd }
+    Batch { obs, act, logp: lp, adv, ret, ep_returns, ep_lengths, ep_track, ep_cmd, ep_getup }
 }
 
 pub struct UpdateStats {

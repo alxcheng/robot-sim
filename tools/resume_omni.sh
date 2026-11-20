@@ -7,7 +7,7 @@ build="${1:-GL}"
 final="${2:-1500}"
 dir="out/ppoomni_${build}"
 if [ -f "$dir/DONE" ]; then echo "finished (DONE marker)"; exit 0; fi
-if pgrep -f "walker_lab ppoomni ${build}" >/dev/null; then
+if pgrep -f "^./target/release/walker_lab ppoomni ${build}" >/dev/null; then
   echo "running: $(tail -1 "out/ppoomni_${build}.log" | cut -c1-60)"
   exit 0
 fi
@@ -26,7 +26,7 @@ if [ -f "$dir/state.json" ]; then
 fi
 left=$(( final - iter ))
 if [ "$left" -le 0 ]; then echo "finished at $iter"; exit 0; fi
-n=$(ls out/ppoomni_${build}_part*.log 2>/dev/null | wc -l)
+n=$( (ls out/ppoomni_${build}_part*.log 2>/dev/null || true) | wc -l)
 cp "out/ppoomni_${build}.log" "out/ppoomni_${build}_part$((n+1)).log"
 cp "$dir/log.json" "$dir/log_part$((n+1)).json"
 nohup ./target/release/walker_lab ppoomni "$build" "$left" "$latest" "$iter" > "out/ppoomni_${build}.log" 2>&1 &
