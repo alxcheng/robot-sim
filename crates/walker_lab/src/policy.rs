@@ -7,7 +7,7 @@ use crate::run_ctl::*;
 use rapier3d::prelude::*;
 use serde::{Deserialize, Serialize};
 
-pub const OBS_DIM: usize = 59;
+pub const OBS_DIM: usize = 63;
 
 /// Contact history the policy is allowed to see (derived from sensors, not from the teacher).
 #[derive(Clone, Copy, Default)]
@@ -94,6 +94,11 @@ pub fn observe(w: &PhysicsWorld, r: &Robot, cmd: Command, tr: &ContactTracker) -
     }
     // Appended last so older networks (58 inputs) can be widened with zero weights.
     push(cmd.lateral / 2.0);
+    // Thruster input [left, up, forward] and dash (appended after; zero for builds without thrusters).
+    for v in cmd.thrust {
+        push(v);
+    }
+    push(if cmd.dash { 1.0 } else { 0.0 });
     debug_assert_eq!(k, OBS_DIM);
     o
 }

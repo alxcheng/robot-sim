@@ -59,6 +59,8 @@ pub enum EpMode {
     Omni,
     /// Knocked down (shove + limp motors), then must get up and stand.
     GetUp,
+    /// Thruster practice: thrust and dash bursts in every direction while jogging or standing.
+    Thrust,
 }
 
 pub const KNOCK_T: f32 = 0.3;
@@ -89,6 +91,7 @@ pub struct Env {
     pub frames: Option<Vec<crate::sim::Frame>>,
     pub label: String,
     last_thrust: Vec<(Vector, Vector)>,
+    max_h: f32,
 }
 
 fn random_scenario(spec: RobotSpec, rng: &mut Rng, dur: f32, vmax: f32) -> Scenario {
@@ -139,14 +142,75 @@ fn omni_scenario(spec: RobotSpec, rng: &mut Rng, dur: f32) -> Scenario {
     sc
 }
 
+/// Thruster practice: a slow jog or stand, with bursts of thrust (1-2.5 s) or dash (0.4 s).
+fn thrust_scenario(spec: RobotSpec, rng: &mut Rng, dur: f32) -> Scenario {
+    let mut sc = scenario("run_mid", 0.0);
+    sc.spec = spec;
+    sc.duration = dur;
+    sc.commands.clear();
+    let mut t = 0.0;
+    let heading = (rng.f() - 0.5) * 0.6;
+    sc.commands.push(cmd(0.0, 1.0, heading));
+    t += 1.5;
+    while t < dur {
+        let base_v = if rng.f() < 0.5 { 0.0 } else { 0.5 + 1.5 * rng.f() };
+        // Direction: left, right, forward, back, up, or a horizontal mix.
+        let k = rng.f();
+        let s = if rng.f() < 0.5 { 1.0 } else { -1.0 };
+        let dir = if k < 0.2 {
+            [s, 0.0, 0.0]
+        } else if k < 0.45 {
+            [0.0, 0.0, s]
+        } else if k < 0.65 {
+            [0.0, 1.0, 0.0]
+        } else {
+            let a = rng.f() * std::f32::consts::TAU;
+            [a.sin(), 0.0, a.cos()]
+        };
+        let dash = rng.f() < 0.3;
+        let mag = if dash { 1.0 } else { 0.4 + 0.6 * rng.f() };
+        let on = if dash { 0.4 } else { 1.0 + 1.5 * rng.f() };
+        let thrust = [dir[0] * mag, dir[1] * mag, dir[2] * mag];
+        sc.commands.push(cmd_t(t, base_v, 0.0, heading, thrust, dash));
+        // Then coast and recover at the base jog.
+        sc.commands.push(cmd(t + on, base_v, heading));
+        t += on + 1.5 + 1.0 * rng.f();
+    }
+    sc
+}
+
 impl Env {
+    /// Highest centre-of-mass height reached so far.
+    pub fn max_height(&self) -> f32 {
+        self.max_h
+    }
+    /// Label recorded frames after the fact: each label shows for 1.5 s from its start time.
+    pub fn set_labels(&mut self, labels: &[(f32, String)]) {
+        if let Some(fr) = self.frames.as_mut() {
+            for f in fr.iter_mut() {
+                f.label = labels.iter().rev().find(|(t, _)| f.t >= *t && f.t < *t + 1.5).map(|l| l.1.clone()).unwrap_or_default();
+            }
+        }
+    }
     pub fn new(spec: RobotSpec, gait: RunGait, seed: u64, vmax: f32, omni: bool) -> Self {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let k = rng.f();
-        let mode = if !omni || k < 0.4 { EpMode::Run } else if k < 0.75 { EpMode::Omni } else { EpMode::GetUp };
+        let mode = if !omni {
+            EpMode::Run
+        } else if spec.thrusters {
+            // Thruster builds: keep the old skills while learning to ride the thrusters.
+            if k < 0.25 { EpMode::Run } else if k < 0.5 { EpMode::Omni } else if k < 0.65 { EpMode::GetUp } else { EpMode::Thrust }
+        } else if k < 0.4 {
+            EpMode::Run
+        } else if k < 0.75 {
+            EpMode::Omni
+        } else {
+            EpMode::GetUp
+        };
         let sc = match mode {
             EpMode::Run => random_scenario(spec, &mut rng, 10.0, vmax),
             EpMode::Omni => omni_scenario(spec, &mut rng, 10.0),
+            EpMode::Thrust => thrust_scenario(spec, &mut rng, 10.0),
             EpMode::GetUp => {
                 let mut sc = scenario("run_mid", 0.0);
                 sc.spec = spec;
@@ -165,7 +229,7 @@ impl Env {
         Env {
             w, r, sc, t: 0.0, tracker: Default::default(), gait, prev_a: vec![0.0; ACTION_DIM],
             last_td: None, foot_prev: [true; 2], toe_peak: [0.0; 2], ep_return: 0.0, track_sum: 0.0, track_n: 0.0, cmd_sum: 0.0, last_td_t: -1.0,
-            mode, knock_dir, stood_s: 0.0, first_stand_t: None, frames: None, label: String::new(), last_thrust: Vec::new(),
+            mode, knock_dir, stood_s: 0.0, first_stand_t: None, frames: None, label: String::new(), last_thrust: Vec::new(), max_h: 0.0,
         }
     }
 
@@ -246,6 +310,7 @@ impl Env {
         let c = [foot_in_contact(&self.w, &self.r.legs[0]), foot_in_contact(&self.w, &self.r.legs[1])];
         self.tracker.update(c, DT);
         let tel = telemetry(&self.w, &self.r, None);
+        self.max_h = self.max_h.max(tel.com[1]);
         self.record(cmdv, &tel, c);
         let finite = tel.com.iter().all(|v| v.is_finite());
         let smooth: f32 = a_norm.iter().zip(&self.prev_a).map(|(a, b)| (a - b) * (a - b)).sum();
@@ -278,6 +343,26 @@ impl Env {
         let fallen = !finite || tel.trunk_tilt > 0.9 || tel.com[1] < 1.2;
         if fallen {
             return (-10.0, true, false);
+        }
+        let thrusting = cmdv.thrust.iter().any(|v| v.abs() > 1e-3) || cmdv.dash;
+        if self.mode == EpMode::Thrust && thrusting {
+            // Ride the thrust: stay upright and on heading, let the body move the way it's pushed
+            // (feet keep stepping under it), and land cleanly after going up.
+            let vw = Vector::from_array(tel.com_vel);
+            let yaw = tel.yaw;
+            let want = Rotation::from_rotation_y(yaw) * Vector::new(cmdv.thrust[0], 0.0, cmdv.thrust[2]);
+            let head_err = wrap(cmdv.heading - yaw);
+            let tilt_deg = tel.trunk_tilt.to_degrees();
+            let mut rew = 1.0 + 0.3 * (-head_err * head_err / 0.05).exp() - 0.04 * (tilt_deg - 10.0).max(0.0) - 0.002 * smooth;
+            let hl = want.length();
+            if hl > 0.1 {
+                let along = Vector::new(vw.x, 0.0, vw.z).dot(want / hl);
+                rew += 0.5 * (along / 3.0).clamp(-1.0, 1.0);
+            }
+            self.track_sum += 1.0;
+            self.track_n += 1.0;
+            self.ep_return += rew;
+            return (rew, false, self.t >= self.sc.duration);
         }
         let vh = Rotation::from_rotation_y(-tel.yaw) * Vector::from_array(tel.com_vel);
         let (v_f, v_l) = (vh.z, vh.x);

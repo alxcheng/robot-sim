@@ -235,7 +235,10 @@ fn run_gait_path(build: &str, assist: f32) -> String {
 }
 
 fn load_run_gait(build: &str, assist: f32) -> run_ctl::RunGait {
+    // Thruster builds (GLT/GMT/GHT) share their base build's gait.
+    let base = build.strip_suffix('T').filter(|b| b.starts_with('G')).unwrap_or(build);
     fs::read_to_string(run_gait_path(build, assist))
+        .or_else(|_| fs::read_to_string(run_gait_path(base, assist)))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
@@ -640,7 +643,31 @@ fn eval_omni(build: &str, gait: run_ctl::RunGait, net: &policy::Mlp, dir: &str, 
         ups.push(serde_json::json!({"stood_at_end": env.standing(), "first_stand_s": env.first_stand_t.map(|t| t - ppo::KNOCK_T)}));
     }
     out.insert("getup".into(), serde_json::Value::Array(ups));
+    if build_spec(build).thrusters {
+        // Thrust 2 s in each direction from a slow jog, then 3 s to recover; did it stay up, and
+        // what was the peak speed along the thrust (height gained, for up)?
+        let mut th = serde_json::Map::new();
+        for (name, dir, dash) in [("L", [1.0, 0.0, 0.0], false), ("R", [-1.0, 0.0, 0.0], false), ("F", [0.0, 0.0, 1.0], false),
+            ("B", [0.0, 0.0, -1.0], false), ("U", [0.0, 1.0, 0.0], false), ("dashF", [0.0, 0.0, 1.0], true), ("dashL", [1.0, 0.0, 0.0], true)] {
+            let on = if dash { 0.4 } else { 2.0 };
+            let sc = mk(vec![cmd(0.0, 1.0, 0.0), cmd_t(1.5, 1.0, 0.0, 0.0, dir, dash), cmd(1.5 + on, 1.0, 0.0)], 6.5);
+            let (env, vel, fell) = run_env(build, gait, net, sc, ppo::EpMode::Thrust, 0.0, "", false);
+            let peak = if dir[1] > 0.0 {
+                env.max_height()
+            } else {
+                vel.iter().map(|v| v.1 * dir[2] + v.2 * dir[0]).fold(0.0f32, f32::max)
+            };
+            th.insert(name.into(), serde_json::json!({"peak": peak, "fell": fell}));
+        }
+        out.insert("thrust".into(), serde_json::Value::Object(th));
+    }
     if clips {
+        if build_spec(build).thrusters {
+            let (cmds, labels) = thrust_script();
+            let (mut env, _, _) = run_env(build, gait, net, mk(cmds, 13.0), ppo::EpMode::Thrust, 0.0, "", true);
+            env.set_labels(&labels);
+            save_clip(&env, &format!("{dir}/clip_thrust_iter{it:04}.json"), &format!("THRUSTERS · iter {it}"));
+        }
         // Demo: forward → backwards → sidestep left → sidestep right, then a knockdown.
         let demo = mk(vec![cmd(0.0, 1.5, 0.0), cmd_l(3.0, -1.5, 0.0, 0.0), cmd_l(6.0, 0.0, 1.0, 0.0), cmd_l(9.0, 0.0, -1.0, 0.0)], 12.0);
         let (env, _, _) = run_env(build, gait, net, demo, ppo::EpMode::Omni, 0.0, "", true);
@@ -705,6 +732,10 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
             let stood = (0..4).filter(|k| g[*k]["stood_at_end"].as_bool().unwrap_or(false)).count();
             let f = |k: &str| format!("{}{:+.1}/{:+.1}{}", k, ev[k]["fwd"].as_f64().unwrap(), ev[k]["left"].as_f64().unwrap(), if ev[k]["fell"].as_bool().unwrap() { "✗" } else { "" });
             println!("  omni {it}: {} | {} | {} | {} | get-up {stood}/4", f("back"), f("left"), f("right"), f("fwd6"));
+            if let Some(th) = ev["thrust"].as_object() {
+                let s: Vec<String> = th.iter().map(|(k, v)| format!("{k} {:.1}{}", v["peak"].as_f64().unwrap_or(0.0), if v["fell"].as_bool().unwrap_or(false) { "✗" } else { "✓" })).collect();
+                println!("  thrust {it}: {}", s.join(" | "));
+            }
             fs::write(format!("{dir}/policy_iter{it:04}.json"), serde_json::to_string(pol).unwrap()).unwrap();
             log.push(serde_json::json!({"iter": it, "omni": ev, "train": extra}));
             fs::write(format!("{dir}/log.json"), serde_json::to_string_pretty(&*log).unwrap()).unwrap();
@@ -889,18 +920,9 @@ fn pose(build: &str, out: &str, twist: f32) {
 }
 
 /// Thruster demo: legs run the given policy while the thrusters follow a scripted input sequence.
-fn thrust_demo(build: &str, policy_path: &str, out: &str) {
-    let txt = fs::read_to_string(policy_path).expect("policy");
-    let mut net = match serde_json::from_str::<ppo::GaussPolicy>(&txt) {
-        Ok(p) => p.net,
-        Err(_) => serde_json::from_str::<policy::Mlp>(&txt).unwrap(),
-    };
-    net.expand_inputs(policy::OBS_DIM);
-    let gait = load_run_gait("GL", 0.0);
-    let mut sc = scenario("run_mid", 0.0);
-    sc.spec = build_spec(build);
-    sc.duration = 13.0;
-    sc.commands = vec![
+/// Demo: jog, thrust left, dash forward, thrust up, thrust back, dash right.
+fn thrust_script() -> (Vec<(f32, controller::Command)>, Vec<(f32, String)>) {
+    let cmds = vec![
         cmd(0.0, 2.0, 0.0),
         cmd_t(2.0, 1.0, 0.0, 0.0, [1.0, 0.0, 0.0], false),   // strafe left on thrust
         cmd_t(3.5, 1.0, 0.0, 0.0, [0.0, 0.0, 0.0], false),
@@ -913,7 +935,23 @@ fn thrust_demo(build: &str, policy_path: &str, out: &str) {
         cmd_t(10.0, 0.5, 0.0, 0.0, [-1.0, 0.0, 0.0], true),  // dash right
         cmd_t(10.35, 1.0, 0.0, 0.0, [0.0, 0.0, 0.0], false),
     ];
-    let labels = [(2.0, "THRUST LEFT"), (4.0, "DASH FORWARD"), (6.0, "THRUST UP"), (8.0, "THRUST BACK"), (10.0, "DASH RIGHT")];
+    let labels = vec![(2.0, "THRUST LEFT".to_string()), (4.0, "DASH FORWARD".to_string()), (6.0, "THRUST UP".to_string()), (8.0, "THRUST BACK".to_string()), (10.0, "DASH RIGHT".to_string())];
+    (cmds, labels)
+}
+
+fn thrust_demo(build: &str, policy_path: &str, out: &str) {
+    let txt = fs::read_to_string(policy_path).expect("policy");
+    let mut net = match serde_json::from_str::<ppo::GaussPolicy>(&txt) {
+        Ok(p) => p.net,
+        Err(_) => serde_json::from_str::<policy::Mlp>(&txt).unwrap(),
+    };
+    net.expand_inputs(policy::OBS_DIM);
+    let gait = load_run_gait("GL", 0.0);
+    let mut sc = scenario("run_mid", 0.0);
+    sc.spec = build_spec(build);
+    sc.duration = 13.0;
+    sc.commands = thrust_script().0;
+    let labels = thrust_script().1;
     let cfg = ppo::RewardCfg { stride_target: 1.8, vmax: 7.0, speed_mode: true, omni: true, knock_dv: 3.0 };
     let mut env = ppo::Env::with(sc.spec, gait, sc.clone(), ppo::EpMode::Omni, 0.0);
     env.frames = Some(Vec::new());
