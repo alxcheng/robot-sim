@@ -20,21 +20,36 @@ pub struct ThrustOut {
     pub forces: Vec<(Vector, Vector)>,
 }
 
-/// Desired force (N, world frame) for a heading-frame thrust command and dash flag.
-/// `input`: [left, up, forward] in −1..1. Up = 1 lifts with 1.3 g; horizontal = 1 is 4 m/s².
-/// `dash` is the dash level 0..1 (it spools up and down like the thrust).
-pub fn desired_force(r: &Robot, yaw: f32, input: [f32; 3], dash: f32) -> Vector {
+/// Fastest descent the landing brake allows (m/s).
+pub const SAFE_DESCENT: f32 = 3.0;
+
+/// Desired force (N, world frame) for a heading-frame thrust command.
+/// `input`: [left, up, forward] in −1..1; `dash` is the dash level 0..1 (it spools like the thrust);
+/// `vy` is the centre of mass's vertical velocity.
+/// Horizontal = 1 is 4 m/s² (dash 15). Up is a climb-rate command, 2.5 m/s at full input (dash 5),
+/// limited to 1.3 g of lift (dash 2 g), so holding up rises steadily instead of rocketing.
+pub fn desired_force(r: &Robot, yaw: f32, input: [f32; 3], dash: f32, vy: f32) -> Vector {
     let m = r.total_mass;
     let g = 9.81;
     let horiz = 4.0 + 11.0 * dash;
-    let up = 1.3 + 0.7 * dash;
+    let up_max = (1.3 + 0.7 * dash) * m * g;
     let h = Rotation::from_rotation_y(yaw) * Vector::new(input[0] * horiz * m, 0.0, input[2] * horiz * m);
     // Horizontal boosting also carries part of the weight (skimming), so the feet aren't dragged
     // sideways under full load; lift scales with how hard the horizontal input is.
     let hmag = (input[0] * input[0] + input[2] * input[2]).sqrt().min(1.0);
-    let skim: f32 = std::env::var("THR_SKIM").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5);
-    let v = (if input[1] > 0.0 { input[1] * up } else { 0.0 }).max(skim * hmag) * m * g;
+    let skim = 0.3f32;
+    let mut v = skim * hmag * m * g;
+    if input[1] > 0.0 {
+        let climb = input[1] * (2.5 + 2.5 * dash);
+        v = v.max((m * (g + 4.0 * (climb - vy))).clamp(0.0, up_max));
+    }
     h + Vector::new(0.0, v, 0.0)
+}
+
+/// Landing brake: lift that caps the descent speed at SAFE_DESCENT while airborne.
+pub fn brake_force(r: &Robot, vy: f32) -> f32 {
+    let m = r.total_mass;
+    (m * (9.81 + 4.0 * (-SAFE_DESCENT - vy))).clamp(0.0, 1.3 * m * 9.81)
 }
 
 pub fn allocate(w: &PhysicsWorld, r: &Robot, f_des: Vector, tau_des: Vector, dash: f32) -> ThrustOut {
@@ -43,6 +58,11 @@ pub fn allocate(w: &PhysicsWorld, r: &Robot, f_des: Vector, tau_des: Vector, das
     let mut pos = Vec::with_capacity(n);
     let mut dir = Vec::with_capacity(n);
     let mut fmax = Vec::with_capacity(n);
+    // Leg-mounted thrusters (thighs, knees) yank the legs out of their stride, so they cost more:
+    // the torso set does the work and the leg set tops it up when more force is needed.
+    // The thigh-skirt pair is fixed to the pelvis; the knee pair is held in reserve for dashes.
+    let leg_cost: f32 = if dash > 0.05 { 0.3 } else { 1000.0 };
+    let cost: Vec<f32> = r.thrusters.iter().map(|t| if t.name.contains("knee") { leg_cost } else { 1e-3 }).collect();
     for t in &r.thrusters {
         let b = &w.bodies[t.body];
         let rot = *b.rotation();
@@ -52,19 +72,19 @@ pub fn allocate(w: &PhysicsWorld, r: &Robot, f_des: Vector, tau_des: Vector, das
     }
     let arm: Vec<Vector> = pos.iter().map(|p| *p - com).collect();
     let w_tau = 1.0f32;
-    let lambda = 1e-3f32;
     let mut f = vec![Vector::ZERO; n];
     // Step size from the problem's curvature (n + w_τ·Σ|r|²).
-    let curv = n as f32 + w_tau * arm.iter().map(|a| a.length_squared()).sum::<f32>() + lambda;
-    let alpha = 0.5 / curv;
+    let curv = n as f32 + w_tau * arm.iter().map(|a| a.length_squared()).sum::<f32>();
+    // Per-thruster step so a costly (reserve) thruster doesn't slow the others' convergence.
+    let alpha: Vec<f32> = cost.iter().map(|c| 0.5 / (curv + 2.0 * c)).collect();
     for _ in 0..60 {
         let sum_f: Vector = f.iter().copied().sum();
         let sum_t: Vector = arm.iter().zip(&f).map(|(a, fi)| a.cross(*fi)).sum();
         let gf = 2.0 * (sum_f - f_des);
         let gt = 2.0 * w_tau * (sum_t - tau_des);
         for i in 0..n {
-            let grad = gf + gt.cross(arm[i]) + 2.0 * lambda * f[i];
-            let mut fi = f[i] - alpha * grad;
+            let grad = gf + gt.cross(arm[i]) + 2.0 * cost[i] * f[i];
+            let mut fi = f[i] - alpha[i] * grad;
             // Hemisphere around the nominal direction.
             let along = fi.dot(dir[i]);
             if along < 0.0 {
@@ -90,8 +110,7 @@ pub fn attitude_torque(w: &PhysicsWorld, r: &Robot, strength: f32, heading: f32)
     let om = inv_h * w.bodies[r.trunk].angvel();
     let s = strength * r.total_mass / 2087.0;
     let yaw_err = wrap(heading - yaw);
-    let yk: f32 = std::env::var("THR_YAWK").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
-    let tau_y = yk * 30_000.0 * s * yaw_err.clamp(-0.5, 0.5) - yk * 8_000.0 * s * om.y;
+    let tau_y = 30_000.0 * s * yaw_err.clamp(-0.5, 0.5) - 8_000.0 * s * om.y;
     let tau_h = Vector::new(-(60_000.0 * s * p + 15_000.0 * s * om.x), tau_y, -(60_000.0 * s * rl + 15_000.0 * s * om.z));
     Rotation::from_rotation_y(yaw) * tau_h
 }
@@ -105,7 +124,8 @@ pub struct Spool {
 }
 
 impl Spool {
-    pub fn update(&mut self, cmd: &Command) {
+    /// `k` scales the dash level (thrust curriculum); the thrust input arrives already scaled.
+    pub fn update(&mut self, cmd: &Command, k: f32) {
         let toward = |x: &mut f32, target: f32, up_s: f32, down_s: f32| {
             let rate = if target.abs() > x.abs() { DT / up_s } else { DT / down_s };
             *x += (target - *x).clamp(-rate, rate);
@@ -113,7 +133,7 @@ impl Spool {
         for i in 0..3 {
             toward(&mut self.thr[i], cmd.thrust[i], 0.1, 0.35);
         }
-        toward(&mut self.dash, if cmd.dash { 1.0 } else { 0.0 }, 0.05, 0.25);
+        toward(&mut self.dash, if cmd.dash { k } else { 0.0 }, 0.05, 0.25);
     }
     pub fn active(&self) -> bool {
         self.thr.iter().any(|v| v.abs() > 1e-3) || self.dash > 1e-3
@@ -121,25 +141,34 @@ impl Spool {
 }
 
 /// Apply thrusters for a command. Returns the applied forces for recording.
-pub fn apply(w: &mut PhysicsWorld, r: &Robot, cmd: &Command, spool: &mut Spool) -> Vec<(Vector, Vector)> {
+pub fn apply(w: &mut PhysicsWorld, r: &Robot, cmd: &Command, spool: &mut Spool, k: f32) -> Vec<(Vector, Vector)> {
     if r.thrusters.is_empty() {
         return Vec::new();
     }
-    spool.update(cmd);
-    let active = spool.active();
+    spool.update(cmd, k);
+    let (_, com_v) = centre_of_mass(w, r);
+    let airborne = !foot_in_contact(w, &r.legs[0]) && !foot_in_contact(w, &r.legs[1]);
+    // Automatic soft landing: falling faster than SAFE_DESCENT with no foot down fires the thrusters.
+    let braking = airborne && com_v.y < -SAFE_DESCENT + 0.5;
+    let active = spool.active() || braking;
     // Clear last tick's thruster forces on their mount bodies.
     let mut bodies: Vec<RigidBodyHandle> = r.thrusters.iter().map(|t| t.body).collect();
     bodies.sort_by_key(|h| h.into_raw_parts());
     bodies.dedup();
     for b in &bodies {
         w.bodies[*b].reset_forces(true);
+        // add_force_at_point also accumulates torque, which reset_forces does not clear.
+        w.bodies[*b].reset_torques(true);
     }
-    // Thrusters only fire on input (an always-on attitude hold was tested and fought the gait's lean).
+    // Thrusters only fire on input or to brake a fall (an always-on attitude hold was tested and fought the gait's lean).
     if !active {
         return Vec::new();
     }
     let yaw = yaw_of(w.bodies[r.trunk].rotation());
-    let f_des = desired_force(r, yaw, spool.thr, spool.dash);
+    let mut f_des = desired_force(r, yaw, spool.thr, spool.dash, com_v.y);
+    if braking {
+        f_des.y = f_des.y.max(brake_force(r, com_v.y));
+    }
     let tau = attitude_torque(w, r, 1.0, cmd.heading);
     let out = allocate(w, r, f_des, tau, spool.dash);
     for (t, (p, f)) in r.thrusters.iter().zip(&out.forces) {

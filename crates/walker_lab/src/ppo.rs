@@ -40,6 +40,8 @@ impl Rng {
 #[derive(Clone, Copy)]
 pub struct RewardCfg {
     pub stride_target: f32,
+    /// Thrust-episode strength curriculum (fraction of full thrust/dash in practice episodes).
+    pub thrust_k: f32,
     /// Speed curriculum: commands are sampled up to this speed (m/s).
     pub vmax: f32,
     /// Speed mode: tracking tolerance and stride target scale with commanded speed.
@@ -93,6 +95,8 @@ pub struct Env {
     last_thrust: Vec<(Vector, Vector)>,
     max_h: f32,
     spool: crate::thrust::Spool,
+    /// Thrust strength scale for this episode (curriculum; 1 = full).
+    pub thr_k: f32,
 }
 
 fn random_scenario(spec: RobotSpec, rng: &mut Rng, dur: f32, vmax: f32) -> Scenario {
@@ -230,7 +234,7 @@ impl Env {
         Env {
             w, r, sc, t: 0.0, tracker: Default::default(), gait, prev_a: vec![0.0; ACTION_DIM],
             last_td: None, foot_prev: [true; 2], toe_peak: [0.0; 2], ep_return: 0.0, track_sum: 0.0, track_n: 0.0, cmd_sum: 0.0, last_td_t: -1.0,
-            mode, knock_dir, stood_s: 0.0, first_stand_t: None, frames: None, label: String::new(), last_thrust: Vec::new(), max_h: 0.0, spool: Default::default(),
+            mode, knock_dir, stood_s: 0.0, first_stand_t: None, frames: None, label: String::new(), last_thrust: Vec::new(), max_h: 0.0, spool: Default::default(), thr_k: 1.0,
         }
     }
 
@@ -249,13 +253,30 @@ impl Env {
         (v.z, v.x, tel.yaw)
     }
 
+    /// (com height, trunk tilt rad, feet in contact) for diagnostics.
+    pub fn pose_stats(&self) -> (f32, f32, usize) {
+        let tel = telemetry(&self.w, &self.r, None);
+        (tel.com[1], tel.trunk_tilt, tel.feet_in_contact as usize)
+    }
+
     pub fn standing(&self) -> bool {
         let tel = telemetry(&self.w, &self.r, None);
         tel.trunk_tilt < 0.35 && tel.com[1] > 1.6 && tel.feet_in_contact >= 1
     }
 
+    /// Command now, with the thrust curriculum scale applied to thrust episodes.
+    fn cmd_now(&self) -> Command {
+        let mut c = command_at(&self.sc, self.t);
+        if self.mode == EpMode::Thrust {
+            for v in c.thrust.iter_mut() {
+                *v *= self.thr_k;
+            }
+        }
+        c
+    }
+
     pub fn obs(&self) -> [f32; OBS_DIM] {
-        observe(&self.w, &self.r, command_at(&self.sc, self.t), &self.tracker)
+        observe(&self.w, &self.r, self.cmd_now(), &self.tracker)
     }
 
     fn record(&mut self, cmdv: Command, tel: &Telemetry, c: [bool; 2]) {
@@ -275,7 +296,7 @@ impl Env {
 
     /// Advance one control tick with a normalised action. Returns (reward, terminal, truncated).
     pub fn step(&mut self, net: &Mlp, a_norm: &[f32], cfg: RewardCfg) -> (f32, bool, bool) {
-        let cmdv = command_at(&self.sc, self.t);
+        let cmdv = self.cmd_now();
         let real: Vec<f32> = a_norm.iter().enumerate().map(|(i, v)| v * net.out_std[i] + net.out_mean[i]).collect();
         let mut act = Action::from_slice(&real);
         let limp_s = 0.4 + 0.27 * cfg.knock_dv;
@@ -305,7 +326,7 @@ impl Env {
                 trunk.add_force(dv * self.r.total_mass / 0.1, true);
             }
         }
-        self.last_thrust = crate::thrust::apply(&mut self.w, &self.r, &cmdv, &mut self.spool);
+        self.last_thrust = crate::thrust::apply(&mut self.w, &self.r, &cmdv, &mut self.spool, self.thr_k);
         self.w.step();
         self.t += DT;
         let c = [foot_in_contact(&self.w, &self.r.legs[0]), foot_in_contact(&self.w, &self.r.legs[1])];
@@ -439,6 +460,8 @@ pub struct Batch {
     pub ep_cmd: Vec<f32>,
     /// Get-up episodes: 1 if standing at the end, 0 if not; -1 for other episodes.
     pub ep_getup: Vec<f32>,
+    /// Thrust episodes: 1 if it stayed up to the end, 0 if it fell; -1 for other episodes.
+    pub ep_thrust: Vec<f32>,
 }
 
 pub fn logp(mu: &[f32], log_std: &[f32], a: &[f32]) -> f32 {
@@ -455,9 +478,10 @@ pub fn rollout(pol: &GaussPolicy, value: &Mlp, spec: RobotSpec, gait: RunGait, s
     let (gamma, lam) = (0.99f32, 0.95f32);
     let mut rng = Rng(seed | 1);
     let mut env = Env::new(spec, gait, seed, cfg.vmax, cfg.omni);
+    env.thr_k = cfg.thrust_k;
     let mut episode = 0u64;
     let (mut obs, mut act, mut lp, mut rews, mut vals, mut dones, mut boots) = (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
-    let (mut ep_returns, mut ep_lengths, mut ep_track, mut ep_cmd, mut ep_getup) = (vec![], vec![], vec![], vec![], vec![]);
+    let (mut ep_returns, mut ep_lengths, mut ep_track, mut ep_cmd, mut ep_getup, mut ep_thrust) = (vec![], vec![], vec![], vec![], vec![], vec![]);
     for _ in 0..steps {
         let o = env.obs();
         let mu = pol.net.forward_norm(&o);
@@ -479,8 +503,10 @@ pub fn rollout(pol: &GaussPolicy, value: &Mlp, spec: RobotSpec, gait: RunGait, s
             ep_track.push(env.track_sum / env.track_n.max(1.0));
             ep_cmd.push(env.cmd_sum / env.track_n.max(1.0));
             ep_getup.push(if env.mode == EpMode::GetUp { if env.standing() { 1.0 } else { 0.0 } } else { -1.0 });
+            ep_thrust.push(if env.mode == EpMode::Thrust { if term { 0.0 } else { 1.0 } } else { -1.0 });
             episode += 1;
             env = Env::new(spec, gait, seed.wrapping_add(episode * 7919), cfg.vmax, cfg.omni);
+            env.thr_k = cfg.thrust_k;
         }
     }
     // Last state bootstrap for an unfinished episode.
@@ -495,7 +521,7 @@ pub fn rollout(pol: &GaussPolicy, value: &Mlp, spec: RobotSpec, gait: RunGait, s
         adv[t] = gae;
     }
     let ret: Vec<f32> = adv.iter().zip(&vals).map(|(a, v)| a + v).collect();
-    Batch { obs, act, logp: lp, adv, ret, ep_returns, ep_lengths, ep_track, ep_cmd, ep_getup }
+    Batch { obs, act, logp: lp, adv, ret, ep_returns, ep_lengths, ep_track, ep_cmd, ep_getup, ep_thrust }
 }
 
 pub struct UpdateStats {

@@ -585,7 +585,7 @@ fn ppo_train(build: &str, iters: usize, init: &str) {
 /// Deterministic evaluation episode through the PPO environment (supports knockdowns), optionally recorded.
 fn run_env(build: &str, gait: run_ctl::RunGait, net: &policy::Mlp, sc: Scenario, mode: ppo::EpMode, knock_dir: f32, label: &str, rec: bool)
     -> (ppo::Env, Vec<(f32, f32, f32)>, bool) {
-    let cfg = ppo::RewardCfg { stride_target: 1.8, vmax: 7.0, speed_mode: true, omni: true, knock_dv: 3.0 };
+    let cfg = ppo::RewardCfg { stride_target: 1.8, thrust_k: 1.0, vmax: 7.0, speed_mode: true, omni: true, knock_dv: 3.0 };
     let dur = sc.duration;
     let mut env = ppo::Env::with(build_spec(build), gait, sc, mode, knock_dir);
     env.label = label.to_string();
@@ -718,9 +718,23 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
     let mut popt = pol.net.adam();
     let mut vopt = value.adam();
     let mut lsopt = (vec![0.0; run_ctl::ACTION_DIM], vec![0.0; run_ctl::ACTION_DIM], 0);
-    let mut cfg = ppo::RewardCfg { stride_target: 1.8, vmax: 3.1, speed_mode, omni, knock_dv: 1.0 };
+    let mut cfg = ppo::RewardCfg { stride_target: 1.8, thrust_k: 1.0, vmax: 3.1, speed_mode, omni, knock_dv: 1.0 };
     if speed_mode {
         cfg.vmax = vmax0.unwrap_or(3.0);
+    }
+    if spec.thrusters {
+        cfg.thrust_k = 0.3;
+    }
+    // Resuming: restore the curricula saved in the lightweight state file.
+    if iter0 > 0 {
+        if let Some(st) = fs::read_to_string(format!("{dir}/state.json")).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) {
+            if let Some(k) = st["thrust_k"].as_f64() {
+                cfg.thrust_k = k as f32;
+            }
+            if let Some(k) = st["knock_dv"].as_f64() {
+                cfg.knock_dv = k as f32;
+            }
+        }
     }
     let (mut streak, mut vmax_log) = (0usize, vec![(iter0, cfg.vmax)]);
     let mut log = Vec::new();
@@ -788,7 +802,7 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
             let hs: Vec<_> = (0..4).map(|k| s.spawn(move || ppo::rollout(p, v, spec, gait, 6000, (it * 17 + k) as u64 * 1_000_003, cfg))).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        let mut b = ppo::Batch { obs: vec![], act: vec![], logp: vec![], adv: vec![], ret: vec![], ep_returns: vec![], ep_lengths: vec![], ep_track: vec![], ep_cmd: vec![], ep_getup: vec![] };
+        let mut b = ppo::Batch { obs: vec![], act: vec![], logp: vec![], adv: vec![], ret: vec![], ep_returns: vec![], ep_lengths: vec![], ep_track: vec![], ep_cmd: vec![], ep_getup: vec![], ep_thrust: vec![] };
         for x in batches {
             b.obs.extend(x.obs);
             b.act.extend(x.act);
@@ -800,6 +814,7 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
             b.ep_track.extend(x.ep_track);
             b.ep_cmd.extend(x.ep_cmd);
             b.ep_getup.extend(x.ep_getup);
+            b.ep_thrust.extend(x.ep_thrust);
         }
         let roll_s = t0.elapsed().as_secs_f32();
         let lr_pi = if it <= warmup { 0.0 } else { 1e-5 };
@@ -829,15 +844,25 @@ fn ppo_train_mode(build: &str, iters: usize, init: &str, speed_mode: bool, vmax0
                 println!("  >>> top speed raised to {:.1} m/s at iteration {it}", cfg.vmax);
             }
         }
+        // Thrust curriculum: stronger thrust once ≥60% of thrust episodes stay up.
+        let th: Vec<f32> = b.ep_thrust.iter().copied().filter(|v| *v >= 0.0).collect();
+        let th_rate = if th.is_empty() { 0.0 } else { th.iter().sum::<f32>() / th.len() as f32 };
+        if omni && it > warmup && th.len() >= 4 && th_rate >= 0.6 && cfg.thrust_k < 1.0 {
+            cfg.thrust_k = (cfg.thrust_k + 0.1).min(1.0);
+            println!("  >>> thrust strength raised to {:.0}% at iteration {it}", cfg.thrust_k * 100.0);
+        }
         if omni {
             print!("[knock {:.1} getup {:.2}] ", cfg.knock_dv, gu_rate);
+            if !th.is_empty() {
+                print!("[thr {:.0}% up {:.2}] ", cfg.thrust_k * 100.0, th_rate);
+            }
         }
         println!("iter {it:4}: ep_return {ret:7.1} ep_len {len:4.1}s eps {:3} surv {:.2} top_track {:.2} vmax {:.1} | kl {:.4} clip {:.2} vloss {:.3} std {:.3} | {:.0}s",
             b.ep_returns.len(), survive, top_track, cfg.vmax, st.kl, st.clip_frac, st.v_loss, std_mean, t0.elapsed().as_secs_f32());
         // Lightweight save every 10 iterations so a restarted machine loses little work.
         if (speed_mode || omni) && it % 10 == 0 {
             fs::write(format!("{dir}/latest_policy.json"), serde_json::to_string(&pol).unwrap()).unwrap();
-            fs::write(format!("{dir}/state.json"), serde_json::json!({"iter": it, "vmax": cfg.vmax}).to_string()).unwrap();
+            fs::write(format!("{dir}/state.json"), serde_json::json!({"iter": it, "vmax": cfg.vmax, "thrust_k": cfg.thrust_k, "knock_dv": cfg.knock_dv}).to_string()).unwrap();
         }
         let ck_every = if speed_mode { 50 } else { 25 };
         if it % ck_every == 0 {
@@ -940,6 +965,47 @@ fn thrust_script() -> (Vec<(f32, controller::Command)>, Vec<(f32, String)>) {
 }
 
 /// Allocation residuals at the standing pose for each thrust direction.
+/// Run each thrust test and print how it ends: fall time and the pose just before.
+fn thrust_diag(build: &str, policy_path: &str) {
+    let txt = fs::read_to_string(policy_path).expect("policy");
+    let mut net = match serde_json::from_str::<ppo::GaussPolicy>(&txt) {
+        Ok(p) => p.net,
+        Err(_) => serde_json::from_str::<policy::Mlp>(&txt).unwrap(),
+    };
+    net.expand_inputs(policy::OBS_DIM);
+    let gait = load_run_gait(build, 0.0);
+    let cfg = ppo::RewardCfg { stride_target: 1.8, thrust_k: 1.0, vmax: 7.0, speed_mode: true, omni: true, knock_dv: 3.0 };
+    let base: f32 = std::env::var("DIAG_V").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    for (name, dir, dash) in [("none", [0.0, 0.0, 0.0], false), ("L", [1.0, 0.0, 0.0], false), ("R", [-1.0, 0.0, 0.0], false), ("F", [0.0, 0.0, 1.0], false),
+        ("B", [0.0, 0.0, -1.0], false), ("U", [0.0, 1.0, 0.0], false), ("U.5", [0.0, 0.5, 0.0], false), ("L.5", [0.5, 0.0, 0.0], false), ("L.3", [0.3, 0.0, 0.0], false), ("F.3", [0.0, 0.0, 0.3], false), ("B.3", [0.0, 0.0, -0.3], false), ("L.1", [0.1, 0.0, 0.0], false),
+        ("dashF", [0.0, 0.0, 1.0], true), ("dashL", [1.0, 0.0, 0.0], true)] {
+        let on = if dash { 0.4 } else { 2.0 };
+        let mut sc = scenario("run_mid", 0.0);
+        sc.spec = build_spec(build);
+        sc.duration = 6.5;
+        sc.commands = vec![cmd(0.0, 1.0, 0.0), cmd_t(1.5, base, 0.0, 0.0, dir, dash), cmd(1.5 + on, base, 0.0)];
+        let mut env = ppo::Env::with(sc.spec, gait, sc.clone(), ppo::EpMode::Thrust, 0.0);
+        let mut hist = Vec::new();
+        let mut end = String::from("stayed up");
+        while env.t() < sc.duration {
+            let o = env.obs();
+            let a = net.forward_norm(&o);
+            let (_, term, _) = env.step(&net, &a, cfg);
+            let (h, tilt, feet) = env.pose_stats();
+            let (vf, vl, yaw) = env.velocity();
+            hist.push((env.t(), h, tilt.to_degrees(), feet, vf, vl, yaw.to_degrees()));
+            if term {
+                end = format!("FELL at {:.2}s ({:.2}s after thrust end)", env.t(), env.t() - 1.5 - on);
+                break;
+            }
+        }
+        println!("{name:6} {end}");
+        for hh in hist.iter().rev().step_by(15).take(5).collect::<Vec<_>>().iter().rev() {
+            println!("        t {:.2} h {:.2} tilt {:>5.1} feet {} v_f {:+.1} v_l {:+.1} yaw {:+.0}", hh.0, hh.1, hh.2, hh.3, hh.4, hh.5, hh.6);
+        }
+    }
+}
+
 fn thrust_check(build: &str) {
     use rapier3d::prelude::Vector;
     let mut sc = scenario("run_mid", 0.0);
@@ -947,11 +1013,16 @@ fn thrust_check(build: &str) {
     let (w, r) = sim::build_world(&sc);
     for (name, dir, dash) in [("L", [1.0, 0.0, 0.0], false), ("F", [0.0, 0.0, 1.0], false), ("B", [0.0, 0.0, -1.0], false),
         ("U", [0.0, 1.0, 0.0], false), ("dashF", [0.0, 0.0, 1.0], true), ("dashL", [1.0, 0.0, 0.0], true)] {
-        let fd = thrust::desired_force(&r, 0.0, dir, if dash { 1.0 } else { 0.0 });
+        let fd = thrust::desired_force(&r, 0.0, dir, if dash { 1.0 } else { 0.0 }, 0.0);
         let out = thrust::allocate(&w, &r, fd, Vector::ZERO, if dash { 1.0 } else { 0.0 });
         let (com, _) = controller::centre_of_mass(&w, &r);
         let sf: Vector = out.forces.iter().map(|(_, f)| *f).sum();
         let st: Vector = out.forces.iter().map(|(p, f)| (*p - com).cross(*f)).sum();
+        if std::env::var("THR_DUMP").is_ok() {
+            for (t, (p, f)) in r.thrusters.iter().zip(&out.forces) {
+                println!("    {:8} at {:+.2} {:+.2} {:+.2}  f {:>7.0} {:>7.0} {:>7.0}", t.name, p.x, p.y, p.z, f.x, f.y, f.z);
+            }
+        }
         println!("{name:6} want {:>7.0} {:>7.0} {:>7.0} | got {:>7.0} {:>7.0} {:>7.0} | torque {:>7.0} {:>7.0} {:>7.0} N·m",
             fd.x, fd.y, fd.z, sf.x, sf.y, sf.z, st.x, st.y, st.z);
     }
@@ -970,7 +1041,7 @@ fn thrust_demo(build: &str, policy_path: &str, out: &str) {
     sc.duration = 13.0;
     sc.commands = thrust_script().0;
     let labels = thrust_script().1;
-    let cfg = ppo::RewardCfg { stride_target: 1.8, vmax: 7.0, speed_mode: true, omni: true, knock_dv: 3.0 };
+    let cfg = ppo::RewardCfg { stride_target: 1.8, thrust_k: 1.0, vmax: 7.0, speed_mode: true, omni: true, knock_dv: 3.0 };
     let mut env = ppo::Env::with(sc.spec, gait, sc.clone(), ppo::EpMode::Omni, 0.0);
     env.frames = Some(Vec::new());
     let mut fell_at = None;
@@ -1019,6 +1090,7 @@ fn main() {
         Some("diag") => diag(),
         Some("runreport") => run_report(),
         Some("evaldistill") => eval_distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
+        Some("thrustdiag") => thrust_diag(&a(2).unwrap(), &a(3).unwrap()),
         Some("thrustcheck") => thrust_check(&a(2).unwrap()),
         Some("thrustdemo") => thrust_demo(&a(2).unwrap(), &a(3).unwrap(), &a(4).unwrap()),
         Some("pose") => pose(&a(2).unwrap(), &a(3).unwrap(), a(4).map(|s| s.parse().unwrap()).unwrap_or(0.0)),

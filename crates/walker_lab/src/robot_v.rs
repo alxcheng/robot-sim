@@ -42,11 +42,23 @@ pub fn build_v(w: &mut PhysicsWorld, o: Vector, spec: RobotSpec) -> Robot {
     // ---------------- pelvis: hip balls on the sides, groin plate below ----------------
     let pelvis_pos = at(0.0, pelvis_y, 0.0);
     let pelvis_half = th([0.26, 0.14, 0.22]);
-    let (pelvis, _) = add_body(w, &mut links, "pelvis".into(), pelvis_pos, &[
+    let mut pelvis_parts = vec![
         p(pelvis_half, [0.0; 3], 430.0 * km, "v_pelvis"),
         p([0.20 * k, 0.07, 0.03], [0.0, 0.0, pelvis_half[2] + 0.03], 150.0, "reactor"),
         p(th([0.12, 0.13, 0.14]), [0.0, -pelvis_half[1] - 0.13, 0.02], 20.0 * km, "v_groin"),
-    ], true);
+    ];
+    // Rear hip-skirt thrusters: they sit just behind the top of each thigh but are fixed to the
+    // pelvis, so firing them pushes the body rather than yanking the leg out of its stride.
+    let hip_x0 = pelvis_half[0] + GAP + 0.15 * kn;
+    let skirt_z = -(0.15 * kn + GAP + 0.09);
+    let skirt_y = hip_y - pelvis_y + 0.04;
+    if spec.thrusters {
+        for side in [1.0f32, -1.0] {
+            pelvis_parts.push(p([0.07, 0.05, 0.05], [side * hip_x0, skirt_y + 0.07, skirt_z + 0.03], 15.0, "v_skirt"));
+            pelvis_parts.push(p([0.06, 0.08, 0.07], [side * hip_x0, skirt_y - 0.05, skirt_z], 30.0, "thruster"));
+        }
+    }
+    let (pelvis, _) = add_body(w, &mut links, "pelvis".into(), pelvis_pos, &pelvis_parts, true);
 
     // ---------------- upper body on a yaw-only waist hinge ----------------
     let upper_y = 2.72;
@@ -115,10 +127,6 @@ pub fn build_v(w: &mut PhysicsWorld, o: Vector, spec: RobotSpec) -> Robot {
         let (cy, hh) = span(hip_y - r_hip - GAP, knee_y + r_knee + GAP);
         let thigh_half = th([0.11, hh, 0.14]);
         let mut thigh_parts = vec![p(thigh_half, [0.0; 3], 240.0 * km, "v_thigh")];
-        let thigh_thr = [0.0, 0.0, -thigh_half[2] * 1.0 - GAP - 0.07];
-        if spec.thrusters {
-            thigh_parts.push(p([0.06, 0.08, 0.07], thigh_thr, 30.0, "thruster"));
-        }
         let (thb, _) = add_body(w, links, format!("{n}_thigh"), at(x, cy, 0.0), &thigh_parts, true);
         let j2 = revolute(w, rg, thb, Vector::X, z, Vector::new(0.0, hip_y - cy, 0.0), Some([-1.8, 1.0]), MAX_TORQUE[HIP_PITCH]);
         let (cy2, hh2) = span(knee_y - r_knee - GAP, hock_y + r_hock + GAP);
@@ -226,8 +234,8 @@ pub fn build_v(w: &mut PhysicsWorld, o: Vector, spec: RobotSpec) -> Robot {
         }
         for (i, leg) in [&left, &right].iter().enumerate() {
             let (tn, kn_) = if i == 0 { ("thigh_L", "knee_L") } else { ("thigh_R", "knee_R") };
-            let tz = -0.14 * k - GAP - 0.07;
-            thrusters.push(Thruster { name: tn, body: leg.bodies[B_THIGH], local_pos: Vector::new(0.0, 0.0, tz), local_dir: Vector::Z, cone: std::f32::consts::FRAC_PI_2, max_force: 4_000.0 * fscale, dash_force: 10_000.0 * fscale });
+            let side = if i == 0 { 1.0 } else { -1.0 };
+            thrusters.push(Thruster { name: tn, body: pelvis, local_pos: Vector::new(side * hip_x0, skirt_y - 0.05, skirt_z - 0.07), local_dir: Vector::Z, cone: std::f32::consts::FRAC_PI_2, max_force: 4_000.0 * fscale, dash_force: 10_000.0 * fscale });
             let (_, hh2) = span(knee_y - r_knee - GAP, hock_y + r_hock + GAP);
             thrusters.push(Thruster { name: kn_, body: leg.bodies[B_SHIN], local_pos: Vector::new(0.0, hh2 - 0.10, 0.19 * k + GAP + 0.06), local_dir: -Vector::Z, cone: std::f32::consts::FRAC_PI_2, max_force: 4_000.0 * fscale, dash_force: 10_000.0 * fscale });
         }
