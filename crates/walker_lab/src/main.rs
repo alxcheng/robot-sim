@@ -648,7 +648,7 @@ fn eval_omni(build: &str, gait: run_ctl::RunGait, net: &policy::Mlp, dir: &str, 
         // what was the peak speed along the thrust (height gained, for up)?
         let mut th = serde_json::Map::new();
         for (name, dir, dash) in [("L", [1.0, 0.0, 0.0], false), ("R", [-1.0, 0.0, 0.0], false), ("F", [0.0, 0.0, 1.0], false),
-            ("B", [0.0, 0.0, -1.0], false), ("U", [0.0, 1.0, 0.0], false), ("dashF", [0.0, 0.0, 1.0], true), ("dashL", [1.0, 0.0, 0.0], true)] {
+            ("B", [0.0, 0.0, -1.0], false), ("U", [0.0, 1.0, 0.0], false), ("dashF", [0.0, 0.0, 1.0], true), ("dashL", [1.0, 0.0, 0.0], true), ("dashR", [-1.0, 0.0, 0.0], true), ("dashB", [0.0, 0.0, -1.0], true)] {
             let on = if dash { 0.4 } else { 2.0 };
             let sc = mk(vec![cmd(0.0, 1.0, 0.0), cmd_t(1.5, 1.0, 0.0, 0.0, dir, dash), cmd(1.5 + on, 1.0, 0.0)], 6.5);
             let (env, vel, fell) = run_env(build, gait, net, sc, ppo::EpMode::Thrust, 0.0, "", false);
@@ -978,7 +978,7 @@ fn thrust_diag(build: &str, policy_path: &str) {
     let base: f32 = std::env::var("DIAG_V").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
     for (name, dir, dash) in [("none", [0.0, 0.0, 0.0], false), ("L", [1.0, 0.0, 0.0], false), ("R", [-1.0, 0.0, 0.0], false), ("F", [0.0, 0.0, 1.0], false),
         ("B", [0.0, 0.0, -1.0], false), ("U", [0.0, 1.0, 0.0], false), ("U.5", [0.0, 0.5, 0.0], false), ("L.5", [0.5, 0.0, 0.0], false), ("L.3", [0.3, 0.0, 0.0], false), ("F.3", [0.0, 0.0, 0.3], false), ("B.3", [0.0, 0.0, -0.3], false), ("L.1", [0.1, 0.0, 0.0], false),
-        ("dashF", [0.0, 0.0, 1.0], true), ("dashL", [1.0, 0.0, 0.0], true)] {
+        ("dashF", [0.0, 0.0, 1.0], true), ("dashL", [1.0, 0.0, 0.0], true), ("dashR", [-1.0, 0.0, 0.0], true), ("dashB", [0.0, 0.0, -1.0], true), ("dashU", [0.0, 1.0, 0.0], true)] {
         let on = if dash { 0.4 } else { 2.0 };
         let mut sc = scenario("run_mid", 0.0);
         sc.spec = build_spec(build);
