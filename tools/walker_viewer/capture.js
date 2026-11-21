@@ -18,9 +18,10 @@ const { execFileSync } = require('child_process');
   page.on('pageerror', e => console.error('page error:', e.message));
   await page.goto('file://' + path.join(__dirname, 'viewer.html'));
   await page.addScriptTag({ path: path.join(__dirname, 'node_modules/three/build/three.min.js') });
-  await page.evaluate(([r, w, h, cam]) => { window.REC = r; window.CAM = cam; init(w, h); }, [rec, width, height, process.env.CAM || '']);
+  if (process.env.STRIDE) rec.slowmo = Math.round(1 / (rec.dt * fps * Number(process.env.STRIDE)) * 10) / 10;
+  await page.evaluate(([r, w, h, cam, xray]) => { window.REC = r; window.CAM = cam; window.XRAY = xray; init(w, h); }, [rec, width, height, process.env.CAM || '', !!process.env.XRAY]);
 
-  const stride = Math.max(1, Math.round(1 / (rec.dt * fps)));
+  const stride = process.env.STRIDE ? Number(process.env.STRIDE) : Math.max(1, Math.round(1 / (rec.dt * fps)));
   let n = 0;
   for (let i = 0; i < rec.frames.length; i += stride) {
     await page.evaluate(i => show(i), i);

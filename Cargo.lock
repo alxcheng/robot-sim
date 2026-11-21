@@ -23,6 +23,7 @@ version = "0.1.0"
 dependencies = [
  "rapier3d",
  "serde_json",
+ "walker_lab",
 ]
 
 [[package]]

@@ -27,7 +27,7 @@ fn steel(e: f32, yield_: f32) -> SoftBodyMaterial {
         plastic_creep: 60.0,
         plastic_max: 0.6,
         deformation_damping: 4.0,
-        tear_strain: Some(env_or("TEAR", 0.35)),
+        tear_strain: Some(env_or("TEAR", 0.35)).filter(|t| *t > 0.0),
         ..Default::default()
     }
 }
@@ -120,6 +120,182 @@ fn dent_test(plate: &Plate, mat: SoftBodyMaterial, ball_m: f32, ball_r: f32, spe
     Outcome { peak, permanent: dent(&w, h, &rest), pieces: w.soft_bodies.len(), ms: times[times.len() / 2], frames }
 }
 
+/// A robot from the walker lab, with an FEM chest plate bolted on, launched into a concrete wall.
+/// Returns (recording JSON, summary line).
+fn wall_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::Value, String) {
+    use walker_lab::{robot, sim};
+    let mut sc = sim::scenario("run_mid", 0.0);
+    // Same frame as the walker lab's GLT/GMT/GHT builds (Mech-V, deer legs, thrusters).
+    sc.spec = robot::RobotSpec {
+        legs: robot::LegKind::Deer, foot_scale: 1.0, swing_arms: true, reaction_wheels: true, arm_dof: 3,
+        frame: robot::Frame::MechV, strength: 1.3,
+        load: match build { "GL" => robot::Load::Light, "GM" => robot::Load::Medium, _ => robot::Load::Heavy },
+        thrusters: true,
+    };
+    let (mut w, r) = sim::build_world(&sc);
+    w.integration_parameters.num_solver_iterations = env_or("SUBSTEPS", 4.0) as usize;
+    let upper = r.waist.expect("MechV has a waist").1;
+    // Front of the chest (largest z of the upper body's colliders).
+    let mut front = f32::MIN;
+    let mut chest_y = 0.0;
+    for c in w.bodies[upper].colliders().to_vec() {
+        let aabb = w.colliders[c].compute_aabb();
+        front = front.max(aabb.maxs.z);
+        chest_y = w.bodies[upper].translation().y;
+    }
+    // The plate must also clear every other robot part in its footprint (arms, pauldrons, head).
+    let plate_half_xy = (0.45f32, 0.30f32);
+    for l in &r.links {
+        for c in w.bodies[l.body].colliders().to_vec() {
+            let bb = w.colliders[c].compute_aabb();
+            let overlaps_xy = bb.maxs.x > -plate_half_xy.0 && bb.mins.x < plate_half_xy.0
+                && bb.maxs.y > chest_y - plate_half_xy.1 && bb.mins.y < chest_y + plate_half_xy.1;
+            if overlaps_xy && bb.maxs.z > front {
+                if std::env::var("DEBUG").is_ok() {
+                    eprintln!("  {} reaches z {:.2} (chest front {:.2})", l.name, bb.maxs.z, front);
+                }
+                front = bb.maxs.z;
+            }
+        }
+    }
+    // Concrete wall 2.5 m ahead of the chest plate.
+    let wall_z = front + 2.5;
+    let wall_half = Vector::new(3.0, 3.0, 0.4);
+    let wall_c = Vector::new(0.0, wall_half.y, wall_z + wall_half.z);
+    w.insert(
+        RigidBodyBuilder::fixed().translation(wall_c),
+        ColliderBuilder::cuboid(wall_half.x, wall_half.y, wall_half.z).friction(0.8).collision_groups(robot::world_groups()),
+    );
+    // FEM chest plate: 0.9 × 0.6 × 0.06 m, 2 cm in front of the chest, bolted at 8 points.
+    let half = Vector::new(0.45, 0.30, 0.03);
+    let centre = Vector::new(0.0, chest_y, front + env_or("GAPZ", 0.06) + half.z);
+    let builder = SoftBodyBuilder::cuboid(centre, half, 19, 13, 3)
+        .cell_model(SoftBodyCellModel::Corotational)
+        .material(mat)
+        .solver(SoftBodySolver::Fem)
+        .mass(250.0)
+        .can_sleep(false);
+    let rest: Vec<Vector> = builder.particle_positions().to_vec();
+    let h = w.insert_soft_body(builder);
+    // Armor mount: a plain rigid body (plate attachments don't hold on multibody links), fixed to
+    // the chest by an impulse joint, which is also where a bolt-shear threshold would go.
+    let up_pos = *w.bodies[upper].position();
+    let mount_pos = Vector::new(0.0, chest_y, centre.z - half.z - 0.01);
+    let (mount, _) = w.insert(
+        RigidBodyBuilder::dynamic().translation(mount_pos).can_sleep(false),
+        ColliderBuilder::cuboid(0.4, 0.28, 0.01).mass(30.0).collision_groups(InteractionGroups::none()),
+    );
+    let fixed = FixedJointBuilder::new()
+        .local_anchor1(up_pos.inverse_transform_point(mount_pos))
+        .local_anchor2(Vector::ZERO)
+        .contacts_enabled(false);
+    if std::env::var("FREEMOUNT").is_err() {
+        w.insert_impulse_joint(upper, mount, fixed);
+    }
+    let bolts = [(-0.4, -0.25), (0.0, -0.25), (0.4, -0.25), (-0.4, 0.0), (0.4, 0.0), (-0.4, 0.25), (0.0, 0.25), (0.4, 0.25)];
+    let mut n_att = 0;
+    for (i, p) in rest.iter().enumerate() {
+        let back = p.z < centre.z - half.z + 1e-3;
+        if std::env::var("NOBOLT").is_err() && back && bolts.iter().any(|(bx, by)| (p.x - bx).abs() < 0.06 && (p.y - centre.y - by).abs() < 0.06) {
+            let sb = &mut w.soft_bodies[h];
+            sb.attach_particle(i, if std::env::var("DIRECT").is_ok() { upper } else { mount }, &w.bodies);
+            n_att += 1;
+        }
+    }
+    // Rest positions in the upper body's frame, to measure how far the plate is pushed in.
+    let up0 = *w.bodies[upper].position();
+    let rest_local: Vec<Vector> = rest.iter().map(|p| up0.inverse_transform_point(*p)).collect();
+
+    // Launch: a 0.15 s push on every link brings the whole robot to `speed` toward the wall
+    // (a thruster dash), then it coasts into the wall.
+    let push_t = 0.15;
+    let total_mass: f32 = r.links.iter().map(|l| w.bodies[l.body].mass()).sum();
+    let mut frames = Vec::new();
+    let (mut peak_dent, mut peak_decel, mut prev_v) = (0.0f32, 0.0f32, 0.0f32);
+    let mut times = Vec::new();
+    let steps = (2.5 / DT) as usize;
+    for s in 0..steps {
+        let t = s as f32 * DT;
+        for l in &r.links {
+            let b = &mut w.bodies[l.body];
+            b.reset_forces(true);
+            if t < push_t {
+                let m = b.mass();
+                b.add_force(Vector::new(0.0, 0.0, m * speed / push_t), true);
+            }
+        }
+        if t < push_t {
+            let sb = &mut w.soft_bodies[h];
+            sb.reset_forces(true);
+            // add_force applies to every particle: give each its own share.
+            let m = sb.mass() / sb.num_particles() as f32;
+            sb.add_force(Vector::new(0.0, 0.0, m * speed / push_t), true);
+        } else if s == (push_t / DT) as usize + 1 {
+            w.soft_bodies[h].reset_forces(true);
+        }
+        let t0 = Instant::now();
+        w.step();
+        times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        // Dent: deepest push of a plate particle toward the chest, in the chest's frame.
+        let up = *w.bodies[upper].position();
+        let sb = &w.soft_bodies[h];
+        let mut dent = 0.0f32;
+        let mut disp = Vec::with_capacity(sb.num_particles());
+        for (i, p) in sb.particle_positions().enumerate() {
+            let d = rest_local.get(i).map(|r0| (r0.z - up.inverse_transform_point(p).z).max(0.0)).unwrap_or(0.0);
+            dent = dent.max(d);
+            disp.push(d);
+        }
+        peak_dent = peak_dent.max(dent);
+        if std::env::var("DEBUG").is_ok() && s % 5 == 0 {
+            let tz = w.bodies[r.trunk].translation().z;
+            let mz = w.bodies[mount].translation().z;
+            let pc = w.soft_bodies[h].center_of_mass();
+            eprintln!("t {:.2} trunk z {:.2} vz {:.1} mount z {:.2} v {:?} plate com {:.2} {:.2} {:.2} pieces {} dent {:.2}", t, tz, w.bodies[r.trunk].linvel().z, mz, w.bodies[mount].linvel(), pc.x, pc.y, pc.z, w.soft_bodies.len(), dent);
+        }
+        let v = w.bodies[r.trunk].linvel().z;
+        if t > push_t + DT {
+            peak_decel = peak_decel.max((prev_v - v) / DT / 9.81);
+        }
+        prev_v = v;
+        let mut meshes = Vec::new();
+        for (sh, sbx) in w.soft_bodies.iter() {
+            let pos: Vec<f32> = sbx.particle_positions().flat_map(|p| [p.x, p.y, p.z]).collect();
+            let tri: Vec<u32> = sbx.boundary().iter().flat_map(|t| t.iter().copied()).collect();
+            let d: Vec<f32> = if sh == h { disp.clone() } else { vec![0.1; sbx.num_particles()] };
+            meshes.push(serde_json::json!({"p": pos, "t": tri, "d": d}));
+        }
+        let b: Vec<[f32; 7]> = r.links.iter().map(|l| {
+            let bb = &w.bodies[l.body];
+            let (p, q) = (bb.translation(), bb.rotation());
+            [p.x, p.y, p.z, q.x, q.y, q.z, q.w]
+        }).collect();
+        let label = if t < push_t { "DASH".to_string() } else { String::new() };
+        frames.push(serde_json::json!({"t": t, "b": b, "speed": v, "cmd_speed": speed, "heading": 0.0, "cmd_heading": 0.0,
+            "label": label, "feet": 0, "toe": [0.0, 0.0], "contact": [false, false], "soft": meshes, "dent": dent}));
+    }
+    let sb = &w.soft_bodies[h];
+    let mut final_dent = 0.0f32;
+    let up = *w.bodies[upper].position();
+    for (i, p) in sb.particle_positions().enumerate() {
+        if let Some(r0) = rest_local.get(i) {
+            final_dent = final_dent.max(r0.z - up.inverse_transform_point(p).z);
+        }
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let summary = format!(
+        "{build} {:.0} kg at {speed} m/s ({:.0} kJ): plate peak {:.1} cm, permanent {:.1} cm, pieces {}, bolts {} particles, peak decel {:.0} g, median {:.1} ms/step",
+        total_mass, 0.5 * total_mass * speed * speed / 1000.0, peak_dent * 100.0, final_dent * 100.0, w.soft_bodies.len(), n_att, peak_decel, times[times.len() / 2]
+    );
+    let rec = serde_json::json!({
+        "scenario": format!("{} smashed into a wall · {speed} m/s", match build { "GL" => "light robot", "GM" => "medium robot", _ => "heavy robot" }),
+        "assist": 0.0, "dt": DT, "links": r.links, "platform": null, "pushes": [], "frames": frames,
+        "wall": [wall_c.x, wall_c.y, wall_c.z, wall_half.x, wall_half.y, wall_half.z],
+        "summary": summary,
+    });
+    (rec, summary)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let a = |i: usize| args.get(i).cloned();
@@ -146,6 +322,17 @@ fn main() {
             println!("{v} m/s: peak {:.1} cm, permanent {:.1} cm, pieces {}", o.peak * 100.0, o.permanent * 100.0, o.pieces);
             let label = std::env::var("LABEL").unwrap_or_default();
             let rec = serde_json::json!({"speed": v, "ball_r": 0.12, "ball_m": 80.0, "peak": o.peak, "permanent": o.permanent, "pieces": o.pieces, "dt": DT, "label": label, "frames": o.frames});
+            std::fs::write(out, serde_json::to_string(&rec).unwrap()).unwrap();
+        }
+        Some("crash") => {
+            // crash <build GL|GM|GH> <speed> <out.json> [E] [yield]
+            let build = a(2).unwrap();
+            let v: f32 = a(3).unwrap().parse().unwrap();
+            let out = a(4).unwrap();
+            let e: f32 = a(5).map(|s| s.parse().unwrap()).unwrap_or(2.0e8);
+            let y: f32 = a(6).map(|s| s.parse().unwrap()).unwrap_or(0.02);
+            let (rec, summary) = wall_crash(&build, v, steel(e, y));
+            println!("{summary}");
             std::fs::write(out, serde_json::to_string(&rec).unwrap()).unwrap();
         }
         _ => eprintln!("usage: armor_lab dent [E] [yield] | record <speed> <out.json> [E] [yield]"),
