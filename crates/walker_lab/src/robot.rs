@@ -183,6 +183,10 @@ pub fn legs_overlap(w: &PhysicsWorld, r: &Robot) -> bool {
 pub fn robot_groups() -> InteractionGroups {
     InteractionGroups::new(Group::GROUP_2, Group::GROUP_1, InteractionTestMode::And)
 }
+/// A robot part that collides with the world only (armor_lab's rigid inner frames).
+pub fn world_groups_robot() -> InteractionGroups {
+    robot_groups()
+}
 pub fn world_groups() -> InteractionGroups {
     InteractionGroups::new(Group::GROUP_1, Group::ALL, InteractionTestMode::And)
 }
