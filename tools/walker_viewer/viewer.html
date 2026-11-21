@@ -125,8 +125,10 @@ function init(width, height) {
   }
   window.softGroup = new THREE.Group(); scene.add(window.softGroup);
 
-  for (const link of REC.links) {
+  REC.links.forEach((link, li) => {
     const g = new THREE.Group();
+    // Parts replaced by metal shells are drawn from the shell mesh instead.
+    if (REC.hide && REC.hide.includes(li)) { scene.add(g); meshes.push(g); return; }
     for (const s of link.shapes) {
       const mat = new THREE.MeshStandardMaterial({ color: COLORS[s.tag] ?? 0x888888, metalness: 0.45, roughness: 0.6 });
       if (window.XRAY) { mat.transparent = true; mat.opacity = 0.22; mat.depthWrite = false; }
@@ -165,7 +167,7 @@ function init(width, height) {
       }
     }
     scene.add(g); meshes.push(g);
-  }
+  });
 }
 
 function show(i) {
@@ -177,7 +179,7 @@ function show(i) {
   });
   const trunk = f.b[0];
   let target = new THREE.Vector3(trunk[0], 1.6, trunk[2]);
-  if (window.CAM === 'crash' && f.soft && f.soft.length) {
+  if (window.CAM === 'crash' && f.soft && f.soft.length && !REC.hide) {
     // Follow the armor plate (centroid of its first piece).
     const p = f.soft[0].p; let cx = 0, cy = 0, cz = 0; const n = p.length / 3;
     for (let k = 0; k < p.length; k += 3) { cx += p[k]; cy += p[k + 1]; cz += p[k + 2]; }
@@ -185,7 +187,7 @@ function show(i) {
   }
   const off = window.CAM === 'front' ? new THREE.Vector3(0.0, 0.5, 9.5) : window.CAM === 'side' ? new THREE.Vector3(9.5, 0.4, 0.0)
     : window.CAM === 'back' ? new THREE.Vector3(-5.0, 1.6, -7.5)
-    : window.CAM === 'crash' ? new THREE.Vector3(3.6, 0.9, -0.9) : new THREE.Vector3(7.0, 2.4, 5.5);
+    : window.CAM === 'crash' ? (REC.hide ? new THREE.Vector3(6.0, 2.6, -4.2) : new THREE.Vector3(3.6, 0.9, -0.9)) : new THREE.Vector3(7.0, 2.4, 5.5);
   const desired = target.clone().add(off);
   if (!camPos) { camPos = desired.clone(); camTarget = target.clone(); }
   camPos.lerp(desired, 0.08); camTarget.lerp(target, 0.12);
@@ -243,7 +245,7 @@ function show(i) {
     `heading ${(f.heading * 57.3).toFixed(0)}° / cmd ${(f.cmd_heading * 57.3).toFixed(0)}°<br>` +
     `upright assist ${assist}`;
   if (f.dent !== undefined) {
-    document.getElementById('hud').innerHTML += `<br>FEM chest plate: dent <b>${(f.dent * 100).toFixed(1)} cm</b> · peak ${(window.peakDent * 100).toFixed(1)} cm · pieces ${f.soft.length}` +
+    document.getElementById('hud').innerHTML += REC.hide ? `<br>every part FEM metal · metal pieces <b>${f.soft.length}</b>` + `<br>slow motion ×${(REC.slowmo || 1)}` : `<br>FEM chest plate: dent <b>${(f.dent * 100).toFixed(1)} cm</b> · peak ${(window.peakDent * 100).toFixed(1)} cm · pieces ${f.soft.length}` +
       `<br>slow motion ×${(REC.slowmo || 1)}`;
   }
   if (window.flightCount === undefined) { window.flightCount = 0; window.frameCount = 0; }
