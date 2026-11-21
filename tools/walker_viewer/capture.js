@@ -19,12 +19,16 @@ const { execFileSync } = require('child_process');
   await page.goto('file://' + path.join(__dirname, 'viewer.html'));
   await page.addScriptTag({ path: path.join(__dirname, 'node_modules/three/build/three.min.js') });
   if (process.env.STRIDE) rec.slowmo = Math.round(1 / (rec.dt * fps * Number(process.env.STRIDE)) * 10) / 10;
-  await page.evaluate(([r, w, h, cam, xray]) => { window.REC = r; window.CAM = cam; window.XRAY = xray; init(w, h); }, [rec, width, height, process.env.CAM || '', !!process.env.XRAY]);
+  // Frames are streamed one at a time (large recordings crash the page if sent at once).
+  const allFrames = rec.frames;
+  const head = Object.assign({}, rec, { frames: [allFrames[0]] });
+  await page.evaluate(([r, w, h, cam, xray]) => { window.REC = r; window.CAM = cam; window.XRAY = xray; init(w, h); }, [head, width, height, process.env.CAM || '', !!process.env.XRAY]);
+  rec.frames = allFrames;
 
   const stride = process.env.STRIDE ? Number(process.env.STRIDE) : Math.max(1, Math.round(1 / (rec.dt * fps)));
   let n = 0;
   for (let i = 0; i < rec.frames.length; i += stride) {
-    await page.evaluate(i => show(i), i);
+    await page.evaluate(([i, f]) => { REC.frames[i] = f; show(i); REC.frames[i] = null; }, [i, rec.frames[i]]);
     await page.screenshot({ path: path.join(framesDir, `f${String(n).padStart(5, '0')}.png`) });
     n++;
   }

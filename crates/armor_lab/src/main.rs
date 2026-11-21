@@ -24,7 +24,7 @@ fn crumple_metal(e: f32, yield_: f32) -> SoftBodyMaterial {
     SoftBodyMaterial {
         young_modulus: e,
         poisson_ratio: 0.3,
-        elastic_damping_ratio: 1.0,
+        elastic_damping_ratio: env_or("EDAMP", 1.0),
         plastic_yield: yield_,
         plastic_creep: env_or("CREEP", 200.0),
         plastic_max: env_or("PMAX", 1.5),
@@ -315,9 +315,15 @@ fn wall_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::Va
 /// One metal shell: an FEM body standing in for a robot part, bolted to a mount on its link.
 struct Shell {
     handle: SoftBodyHandle,
+    /// The body whose frame the shell's rest shape is expressed in (the link itself when the
+    /// bolts are driven, else the welded mount).
     mount: RigidBodyHandle,
     rest_local: Vec<Vector>,
     link: usize,
+    /// Driven bolts: pinned particles moved with the link every step.
+    driven: Vec<usize>,
+    /// Inner frame box in the link frame (centre, half extents): free skin points are kept outside.
+    frame: (Vector, Vector),
 }
 
 /// Every armored part of the robot as an FEM metal shell, smashed into a wall.
@@ -333,27 +339,43 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
     };
     let (mut w, r) = sim::build_world(&sc);
     w.integration_parameters.num_solver_iterations = env_or("SUBSTEPS", 4.0) as usize;
+    // Optional: drive the joints with the trained thruster policy (runs, then dashes into the wall).
+    let pilot: Option<(walker_lab::policy::Mlp, walker_lab::run_ctl::RunGait)> = std::env::var("POLICY").ok().map(|path| {
+        let txt = std::fs::read_to_string(&path).expect("policy file");
+        let mut net = match serde_json::from_str::<walker_lab::ppo::GaussPolicy>(&txt) {
+            Ok(p) => p.net,
+            Err(_) => serde_json::from_str::<walker_lab::policy::Mlp>(&txt).expect("policy json"),
+        };
+        net.expand_inputs(walker_lab::policy::OBS_DIM);
+        let base = build.trim_end_matches('T');
+        let gtxt = std::fs::read_to_string(format!("out/run_{base}_a0.json")).expect("gait file");
+        (net, serde_json::from_str(&gtxt).expect("gait json"))
+    });
     let spacing = env_or("SPACING", 0.07);
     // Shells collide with the world; the two legs' shells also collide with each other.
-    let world_only = InteractionGroups::new(Group::GROUP_5, Group::GROUP_1, InteractionTestMode::And);
+    let world_only = InteractionGroups::new(Group::GROUP_5, Group::GROUP_1 | Group::GROUP_8, InteractionTestMode::And);
     let leg_groups = |side: usize| {
         if side == 0 {
-            InteractionGroups::new(Group::GROUP_5 | Group::GROUP_6, Group::GROUP_1 | Group::GROUP_7, InteractionTestMode::And)
+            InteractionGroups::new(Group::GROUP_5 | Group::GROUP_6, Group::GROUP_1 | Group::GROUP_7 | Group::GROUP_8, InteractionTestMode::And)
         } else {
-            InteractionGroups::new(Group::GROUP_5 | Group::GROUP_7, Group::GROUP_1 | Group::GROUP_6, InteractionTestMode::And)
+            InteractionGroups::new(Group::GROUP_5 | Group::GROUP_7, Group::GROUP_1 | Group::GROUP_6 | Group::GROUP_8, InteractionTestMode::And)
         }
     };
     let mut shells: Vec<Shell> = Vec::new();
+    let mut shell_info: Vec<serde_json::Value> = Vec::new();
     let mut hidden: Vec<usize> = Vec::new();
     let mut front = f32::MIN;
     for (li, l) in r.links.iter().enumerate() {
         // The part's main shape: the largest solid (skip joint balls, gimbals, wheels).
-        let main = l
+        let main_idx = l
             .shapes
             .iter()
-            .filter(|s| !matches!(s.kind, "ball") && !matches!(s.tag, "gimbal" | "wheel"))
-            .max_by(|a, b| (a.half[0] * a.half[1] * a.half[2]).partial_cmp(&(b.half[0] * b.half[1] * b.half[2])).unwrap());
-        let Some(main) = main else { continue };
+            .enumerate()
+            .filter(|(_, s)| !matches!(s.kind, "ball") && !matches!(s.tag, "gimbal" | "wheel"))
+            .max_by(|(_, a), (_, b)| (a.half[0] * a.half[1] * a.half[2]).partial_cmp(&(b.half[0] * b.half[1] * b.half[2])).unwrap())
+            .map(|(i, _)| i);
+        let Some(main_idx) = main_idx else { continue };
+        let main = &l.shapes[main_idx];
         // Feet stay rigid soles: they carry the whole robot, more than the bolt joints can hold.
         if l.name.ends_with("_foot") {
             continue;
@@ -368,48 +390,31 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
             w.colliders[c].set_collision_groups(InteractionGroups::none());
         }
         let half = Vector::new(main.half[0], main.half[1], main.half[2]);
-        // Rigid inner frame (a smaller box inside the shell): the skin crumples until it meets the
-        // frame, then the frame takes the crash load instead of the bolts.
-        let core_k = env_or("CORE", 0.5);
-        if core_k > 0.0 {
-            let core = ColliderBuilder::cuboid(half.x * core_k, half.y * core_k, half.z * core_k)
-                .translation(Vector::new(main.offset[0], main.offset[1], main.offset[2]))
-                .density(0.0)
-                .friction(0.7)
-                .collision_groups(robot::world_groups_robot());
-            w.insert_collider(core, Some(l.body));
-        }
         let n = |h: f32| ((2.0 * h / spacing).round() as usize + 1).clamp(3, env_or("NMAX", 10.0) as usize);
         let (nx, ny, nz) = (n(half.x), n(half.y), n(half.z));
         let local_c = Vector::new(main.offset[0], main.offset[1], main.offset[2]);
         let proto = SoftBodyBuilder::cuboid(Vector::ZERO, half, nx, ny, nz);
         let local_pts: Vec<Vector> = proto.particle_positions().to_vec();
         let world_pts: Vec<Vector> = local_pts.iter().map(|p| body_pos.transform_point(local_c + *p)).collect();
-        let groups = match robot::leg_side(&l.name) { Some(k) => leg_groups(k), None => world_only };
+        // Each part has its own bit (GROUP_9 upward): its skin collides with its own frame only.
+        let own = Group::from_bits_truncate(1u32 << (8 + shells.len() as u32));
+        let base = match robot::leg_side(&l.name) { Some(k) => leg_groups(k), None => world_only };
+        let groups = InteractionGroups::new(base.memberships | own, (base.filter - Group::GROUP_8) | own, InteractionTestMode::And);
         let builder = proto
             .positions(world_pts.clone())
             .cell_model(if std::env::var("NEO").is_ok() { SoftBodyCellModel::NeoHookean } else { SoftBodyCellModel::Corotational })
             .material(mat)
             .solver(SoftBodySolver::Fem)
             .mass((env_or("SHELLM", 0.1) * link_mass).max(5.0))
+            .particle_radius(env_or("PRAD", 0.01))
             .surface_collider(ColliderBuilder::ball(0.01).friction(env_or("SKINF", 0.2)).collision_groups(groups))
             .can_sleep(false);
         let h = w.insert_soft_body(builder);
-        // Mount: a plain rigid body welded to the link (attachments need a non-multibody body).
-        let centre_w = body_pos.transform_point(local_c);
-        let (mount, _) = w.insert(
-            RigidBodyBuilder::dynamic().position(Pose::from_parts(centre_w, body_pos.rotation)).can_sleep(false),
-            ColliderBuilder::cuboid(0.05, 0.05, 0.05).mass(5.0).collision_groups(InteractionGroups::none()),
-        );
-        w.insert_impulse_joint(
-            l.body,
-            mount,
-            FixedJointBuilder::new().local_anchor1(local_c).local_anchor2(Vector::ZERO).contacts_enabled(false),
-        );
         // Bolts: the inner core, plus the face centres of the two largest axes (the part's
         // mounting points); the outer skin is free to dent.
         let mut axes = [(half.x, 0usize), (half.y, 1), (half.z, 2)];
         axes.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        let mut bolted: Vec<usize> = Vec::new();
         for (i, p) in local_pts.iter().enumerate() {
             let u = [p.x / half.x, p.y / half.y, p.z / half.z];
             // Thin parts (feet, plates) are also bolted across the inner part of their middle layer.
@@ -419,19 +424,87 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
             let face_centre = axes[..2].iter().any(|(_, ax)| {
                 (0..3).all(|k| if k == *ax { u[k].abs() > 0.99 } else { u[k].abs() < 0.05 })
             });
-            if core || face_centre {
-                w.soft_bodies[h].attach_particle(i, mount, &w.bodies);
+            // Joint ends: the whole end faces where the part meets its joints are bolted, so the
+            // shell stays fixed to the actual connections (limbs: both ends of the long axis;
+            // chest: shoulders and waist; pelvis: hips and waist).
+            let long = axes[0].1;
+            // Only the part of an end face inside the inner frame's outline is bolted: a bolted point
+            // in the crumple zone would be driven into the wall past the frame.
+            let core_k0 = env_or("CORE", 0.7);
+            let full: [bool; 3] = match l.name.as_str() {
+                "upper_body" | "pelvis" => [true, true, false],
+                _ => [long == 0, long == 1, long == 2],
+            };
+            let inside_frame = (0..3).all(|k| full[k] || u[k].abs() <= core_k0 - 0.02);
+            let end_face = inside_frame && match l.name.as_str() {
+                "upper_body" => u[0].abs() > 0.99 || u[1] < -0.99,
+                "pelvis" => u[0].abs() > 0.99 || u[1] > 0.99,
+                _ => u[long].abs() > 0.99,
+            };
+            let in_frame_volume = (0..3).all(|k| full[k] || u[k].abs() <= core_k0 + 0.02);
+            let _ = (core, face_centre);
+            if in_frame_volume || (env_or("ENDBOLT", 1.0) > 0.0 && end_face) {
+                bolted.push(i);
             }
         }
-        let rest_local: Vec<Vector> = local_pts.clone();
+        // Rigid inner frame: covers everything that is pinned (full length along the axes whose end
+        // faces bolt to joints, CORE elsewhere), so the skin outside it is a clean crumple zone that
+        // the frame stops before any pinned point reaches the wall.
+        let core_k = env_or("CORE", 0.7);
+        let mut frame_box = (local_c, Vector::ZERO);
+        if core_k > 0.0 {
+            let long = axes[0].1;
+            let full: [bool; 3] = match l.name.as_str() {
+                "upper_body" => [true, true, false],
+                "pelvis" => [true, true, false],
+                _ => [long == 0, long == 1, long == 2],
+            };
+            let k = |ax: usize, h: f32| if full[ax] { h } else { h * core_k };
+            frame_box = (local_c, Vector::new(k(0, half.x), k(1, half.y), k(2, half.z)));
+            let core = ColliderBuilder::cuboid(k(0, half.x), k(1, half.y), k(2, half.z))
+                .translation(local_c)
+                .density(0.0)
+                .friction(0.7)
+                // Frames hit the world and the metal skins (their own and other parts').
+                .collision_groups(InteractionGroups::new(Group::GROUP_2 | own, if env_or("SKINFRAME", 0.0) > 0.0 { Group::GROUP_1 | own } else { Group::GROUP_1 }, InteractionTestMode::And));
+            w.insert_collider(core, Some(l.body));
+        }
+        let drive = env_or("DRIVE", 1.0) > 0.0;
+        let (mount, rest_local, driven) = if drive {
+            // Driven bolts: pinned particles that follow the link exactly (set every step), so the
+            // shell can't jiggle or slide at its connections.
+            let sb = &mut w.soft_bodies[h];
+            for &i in &bolted {
+                sb.set_particle_pinned(i, true);
+            }
+            (l.body, local_pts.iter().map(|p| local_c + *p).collect::<Vec<_>>(), bolted.clone())
+        } else {
+            // Mount: a plain rigid body welded to the link (attachments need a non-multibody body).
+            let centre_w = body_pos.transform_point(local_c);
+            let (mount, _) = w.insert(
+                RigidBodyBuilder::dynamic().position(Pose::from_parts(centre_w, body_pos.rotation)).can_sleep(false),
+                ColliderBuilder::cuboid(0.05, 0.05, 0.05).mass(5.0).collision_groups(InteractionGroups::none()),
+            );
+            w.insert_impulse_joint(
+                l.body,
+                mount,
+                FixedJointBuilder::new().local_anchor1(local_c).local_anchor2(Vector::ZERO).contacts_enabled(false),
+            );
+            for &i in &bolted {
+                w.soft_bodies[h].attach_particle(i, mount, &w.bodies);
+            }
+            (mount, local_pts.clone(), Vec::new())
+        };
         for p in &world_pts {
             front = front.max(p.z);
         }
-        shells.push(Shell { handle: h, mount, rest_local, link: li });
+        shell_info.push(serde_json::json!({"link": li, "shape": main_idx,
+            "rest": rest_local.iter().flat_map(|p| [p.x, p.y, p.z]).collect::<Vec<f32>>()}));
+        shells.push(Shell { handle: h, mount, rest_local, link: li, driven, frame: frame_box });
         hidden.push(li);
     }
-    // Concrete wall 2.5 m ahead.
-    let wall_z = front + 2.5;
+    // Concrete wall 2.5 m ahead (12 m when the robot runs up to it first).
+    let wall_z = front + if pilot.is_some() { env_or("RUNUP", 12.0) } else { 2.5 };
     let wall_half = Vector::new(4.0, 3.5, 0.4);
     let wall_c = Vector::new(0.0, wall_half.y, wall_z + wall_half.z);
     w.insert(
@@ -439,7 +512,7 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
         ColliderBuilder::cuboid(wall_half.x, wall_half.y, wall_half.z).friction(0.8).collision_groups(robot::world_groups()),
     );
     let total_mass: f32 = r.links.iter().map(|l| w.bodies[l.body].mass()).sum::<f32>()
-        + shells.iter().map(|s| w.soft_bodies[s.handle].mass() + w.bodies[s.mount].mass()).sum::<f32>();
+        + shells.iter().map(|s| w.soft_bodies[s.handle].mass() + if s.driven.is_empty() { w.bodies[s.mount].mass() } else { 0.0 }).sum::<f32>();
     let n_particles: usize = shells.iter().map(|s| w.soft_bodies[s.handle].num_particles()).sum();
 
     // Launch: a 0.15 s push on every rigid body and shell particle (a thruster dash).
@@ -448,24 +521,74 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
     let (mut peak_dent, mut peak_decel, mut prev_v, mut times) = (0.0f32, 0.0f32, 0.0f32, Vec::new());
     let mut failed_at = None;
     let mut max_stretch = 1.0f32;
-    let all_bodies: Vec<RigidBodyHandle> = r.links.iter().map(|l| l.body).chain(shells.iter().map(|s| s.mount)).collect();
+    let (mut jiggle_sum, mut jiggle_n, mut rest_jiggle_sum, mut rest_jiggle_n) = (0.0f64, 0usize, 0.0f64, 0usize);
+    let mut all_bodies: Vec<RigidBodyHandle> = r.links.iter().map(|l| l.body).chain(shells.iter().map(|s| s.mount)).collect();
+    all_bodies.sort_by_key(|h| h.into_raw_parts());
+    all_bodies.dedup();
     let steps = (env_or("DUR", 2.5) / DT) as usize;
+    let mut tracker = walker_lab::policy::ContactTracker::default();
+    let mut spool = walker_lab::thrust::Spool::default();
+    // Piloted: the launch starts when the robot is LAUNCH_AT m from the wall, else at t = 0.
+    let launch_at = env_or("LAUNCH_AT", 3.5);
+    let mut launch: Option<(f32, f32)> = if pilot.is_some() { None } else { Some((0.0, speed)) };
     for s in 0..steps {
         let t = s as f32 * DT;
         for b in &all_bodies {
-            let rb = &mut w.bodies[*b];
-            rb.reset_forces(true);
-            if t < push_t {
-                let m = rb.mass();
-                rb.add_force(Vector::new(0.0, 0.0, m * speed / push_t), true);
-            }
+            w.bodies[*b].reset_forces(true);
         }
         for sh in &shells {
-            let sb = &mut w.soft_bodies[sh.handle];
-            sb.reset_forces(true);
-            if t < push_t {
+            w.soft_bodies[sh.handle].reset_forces(true);
+        }
+        let tz = w.bodies[r.trunk].translation().z;
+        if launch.is_none() && pilot.is_some() && tz > wall_z - launch_at {
+            launch = Some((t, speed));
+        }
+        let launching = launch.map(|(t0, _)| t >= t0 && t < t0 + push_t).unwrap_or(false);
+        let mut thr_rec: Vec<[f32; 6]> = Vec::new();
+        if let Some((net, gait)) = &pilot {
+            // Run toward the wall, then a forward dash on the thrusters for the launch.
+            let run_v = (1.5 + 2.0 * t).min(6.0);
+            let mut cmd = walker_lab::controller::Command { speed: run_v, heading: 0.0, ..Default::default() };
+            if launch.map(|(t0, _)| t >= t0 && t < t0 + 0.6).unwrap_or(false) {
+                cmd.thrust = [0.0, 0.0, 1.0];
+                cmd.dash = true;
+            }
+            let o = walker_lab::policy::observe(&w, &r, cmd, &tracker);
+            let a = net.forward_norm(&o);
+            let real: Vec<f32> = a.iter().enumerate().map(|(i, v)| v * net.out_std[i] + net.out_mean[i]).collect();
+            let act = walker_lab::run_ctl::Action::from_slice(&real);
+            walker_lab::run_ctl::apply_action(&mut w, &r, &act, gait.kd);
+            walker_lab::run_ctl::reflexes(&mut w, &r, gait.wheel_k, 0.0, gait.lean + gait.lean_v * cmd.speed.max(0.0));
+            let forces = walker_lab::thrust::apply(&mut w, &r, &cmd, &mut spool, 1.0);
+            thr_rec = forces.iter().filter(|(_, f)| f.length() > 50.0).map(|(p, f)| [p.x, p.y, p.z, f.x / 1000.0, f.y / 1000.0, f.z / 1000.0]).collect();
+        }
+        if launching {
+            // Extra launch force (beyond the thrusters) so the robot hits the wall at `speed`.
+            let vz = w.bodies[r.trunk].linvel().z;
+            let need = ((speed - vz) / (push_t * 0.5)).max(0.0);
+            for b in &all_bodies {
+                let rb = &mut w.bodies[*b];
+                let m = rb.mass();
+                rb.add_force(Vector::new(0.0, 0.0, m * need), true);
+            }
+            for sh in &shells {
+                let sb = &mut w.soft_bodies[sh.handle];
                 let m = sb.mass() / sb.num_particles() as f32;
-                sb.add_force(Vector::new(0.0, 0.0, m * speed / push_t), true);
+                sb.add_force(Vector::new(0.0, 0.0, m * need), true);
+            }
+        }
+        // Driven bolts: move each pinned particle to where its link will be after this step.
+        for sh in &shells {
+            if sh.driven.is_empty() {
+                continue;
+            }
+            let lb = &w.bodies[sh.mount];
+            let (pos, v, om) = (*lb.position(), lb.linvel(), lb.angvel());
+            let next_rot = Rotation::from_scaled_axis(om * DT) * pos.rotation;
+            let next = Pose::from_parts(pos.translation + v * DT, next_rot);
+            let sb = &mut w.soft_bodies[sh.handle];
+            for &i in &sh.driven {
+                sb.set_particle_kinematic_target(i, next.transform_point(sh.rest_local[i]));
             }
         }
         let t0 = Instant::now();
@@ -475,6 +598,7 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
             failed_at = Some(t);
             break;
         }
+        tracker.update([walker_lab::controller::foot_in_contact(&w, &r.legs[0]), walker_lab::controller::foot_in_contact(&w, &r.legs[1])], DT);
         // Stability guardrail: clamp runaway velocities (the spec's post-step safety pass).
         let mut bad = false;
         for b in &all_bodies {
@@ -490,6 +614,47 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
             failed_at = Some(t);
             break;
         }
+        // Skin against its own frame (done by hand: a frame inside a solid skin can't be a contact):
+        // a free skin point pushed into the frame goes back to the frame's surface, and no skin
+        // point may end up more than MAXD from where it belongs on the part.
+        let maxd = env_or("MAXD", 0.25);
+        for sh in &shells {
+            if sh.driven.is_empty() || sh.frame.1 == Vector::ZERO {
+                continue;
+            }
+            let lb = &w.bodies[sh.mount];
+            let (lp, lv, lw) = (*lb.position(), lb.linvel(), lb.angvel());
+            let (fc, fh) = sh.frame;
+            let sb = &mut w.soft_bodies[sh.handle];
+            for i in 0..sb.num_particles() {
+                if sh.driven.contains(&i) {
+                    continue;
+                }
+                let p = sb.particle_position(i);
+                let mut q = lp.inverse_transform_point(p);
+                let mut moved = false;
+                let d = q - fc;
+                if d.x.abs() < fh.x && d.y.abs() < fh.y && d.z.abs() < fh.z {
+                    // Out through the nearest face.
+                    let gaps = [fh.x - d.x.abs(), fh.y - d.y.abs(), fh.z - d.z.abs()];
+                    let ax = (0..3).min_by(|a, b| gaps[*a].partial_cmp(&gaps[*b]).unwrap()).unwrap();
+                    let mut dd = d;
+                    dd[ax] = fh[ax].copysign(if d[ax] == 0.0 { 1.0 } else { d[ax] });
+                    q = fc + dd;
+                    moved = true;
+                }
+                let off = q - sh.rest_local[i];
+                if off.length() > maxd {
+                    q = sh.rest_local[i] + off * (maxd / off.length());
+                    moved = true;
+                }
+                if moved {
+                    let np = lp.transform_point(q);
+                    sb.set_particle_position(i, np);
+                    sb.set_particle_velocity(i, lv + lw.cross(np - lp.translation));
+                }
+            }
+        }
         // Soft guardrail: a particle may not move faster than 30 m/s relative to its mount.
         let vclamp = env_or("PVCLAMP", 12.0);
         for sh in &shells {
@@ -499,6 +664,26 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
                 let rel = sb.particle_velocity(i) - mv;
                 if rel.length() > vclamp {
                     sb.set_particle_velocity(i, mv + rel * (vclamp / rel.length()));
+                }
+            }
+        }
+        // Jiggle: RMS speed of the metal relative to its part's own rigid motion, before the launch
+        // (standing) and over the last 0.8 s (after the crash has settled).
+        let settle = t > env_or("DUR", 2.5) - 0.8;
+        if settle || t < push_t {
+            for sh in &shells {
+                let mb = &w.bodies[sh.mount];
+                let (mp, mv, mw) = (mb.translation(), mb.linvel(), mb.angvel());
+                let sb = &w.soft_bodies[sh.handle];
+                for i in 0..sb.num_particles() {
+                    let rel = sb.particle_velocity(i) - (mv + mw.cross(sb.particle_position(i) - mp));
+                    if settle {
+                        jiggle_sum += rel.length_squared() as f64;
+                        jiggle_n += 1;
+                    } else {
+                        rest_jiggle_sum += rel.length_squared() as f64;
+                        rest_jiggle_n += 1;
+                    }
                 }
             }
         }
@@ -512,6 +697,11 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
                     let rest = (sh.rest_local[ia] - sh.rest_local[ib]).length();
                     let len = (sb.particle_position(ia) - sb.particle_position(ib)).length();
                     if rest > 1e-4 {
+                        if len / rest > max_stretch.max(2.5) && std::env::var("DEBUG").is_ok() {
+                            let pa = sh.driven.contains(&ia);
+                            let pb = sh.driven.contains(&ib);
+                            eprintln!("  stretch {:.1}x t {:.2} {} pinned {}/{} rest a {:?} b {:?} pos a {:?}", len / rest, t, r.links[sh.link].name, pa, pb, sh.rest_local[ia], sh.rest_local[ib], sb.particle_position(ia));
+                        }
                         max_stretch = max_stretch.max(len / rest);
                     }
                 }
@@ -555,7 +745,7 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
         }
         peak_dent = peak_dent.max(dent_now);
         let v = w.bodies[r.trunk].linvel().z;
-        if t > push_t + DT {
+        if launch.map(|(t0, _)| t > t0 + push_t + DT).unwrap_or(false) {
             peak_decel = peak_decel.max((prev_v - v) / DT / 9.81);
         }
         prev_v = v;
@@ -568,7 +758,7 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
             eprintln!("t {:.2} trunk z {:.2} vz {:.1} pieces {} dent {:.2}", t, w.bodies[r.trunk].translation().z, v, w.soft_bodies.len(), dent_now);
         }
         frames.push(serde_json::json!({"t": t, "b": b, "speed": v, "cmd_speed": speed, "heading": 0.0, "cmd_heading": 0.0,
-            "label": if t < push_t { "DASH" } else { "" }, "feet": 0, "toe": [0.0, 0.0], "contact": [false, false], "soft": meshes, "dent": dent_now}));
+            "label": if launching { "DASH" } else { "" }, "feet": 0, "toe": [0.0, 0.0], "contact": [false, false], "soft": meshes, "dent": dent_now, "thr": thr_rec}));
     }
     if std::env::var("DEBUG").is_ok() {
         for sh in &shells {
@@ -603,7 +793,8 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
         }
         let _ = d;
         let d = bend;
-        let slip = sb.particle_attachments().iter().map(|a| (mp.inverse_transform_point(sb.particle_position(a.particle as usize)) - sh.rest_local[a.particle as usize]).length()).fold(0.0f32, f32::max);
+        let bolt_ids: Vec<usize> = if sh.driven.is_empty() { sb.particle_attachments().iter().map(|a| a.particle as usize).collect() } else { sh.driven.clone() };
+        let slip = bolt_ids.iter().map(|&i| (mp.inverse_transform_point(sb.particle_position(i)) - sh.rest_local[i]).length()).fold(0.0f32, f32::max);
         final_def.push((format!("{} (bolt slip {:.0})", r.links[sh.link].name, slip * 100.0), d));
     }
     final_def.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -611,7 +802,8 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let pieces = w.soft_bodies.len();
     let summary = format!(
-        "max edge stretch {max_stretch:.2}× | most bent (largest permanent change in a metal edge): {} | {build} all-metal ({} shells, {} particles) {:.0} kg at {speed} m/s ({:.0} kJ): peak strain {:.0}%, {} metal pieces, peak decel {:.0} g, median {:.0} ms/step{}",
+        "jiggle after crash {:.2} m/s rms | max edge stretch {max_stretch:.2}× | most bent (largest permanent change in a metal edge): {} | {build} all-metal ({} shells, {} particles) {:.0} kg at {speed} m/s ({:.0} kJ): peak strain {:.0}%, {} metal pieces, peak decel {:.0} g, median {:.0} ms/step{}",
+        (jiggle_sum / jiggle_n.max(1) as f64).sqrt(),
         top.join(", "),
         shells.len(), n_particles, total_mass, 0.5 * total_mass * speed * speed / 1000.0, peak_dent * 100.0, pieces, peak_decel,
         times.get(times.len() / 2).copied().unwrap_or(0.0),
@@ -621,7 +813,7 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
         "scenario": format!("all-metal {} robot smashed into a wall · {speed} m/s", match build { "GL" => "light", "GM" => "medium", _ => "heavy" }),
         "assist": 0.0, "dt": DT, "links": r.links, "platform": null, "pushes": [], "frames": frames,
         "wall": [wall_c.x, wall_c.y, wall_c.z, wall_half.x, wall_half.y, wall_half.z],
-        "hide": hidden, "summary": summary,
+        "hide": hidden, "shells": shell_info, "summary": summary,
     });
     (rec, summary)
 }
