@@ -259,6 +259,14 @@ impl Env {
         (tel.com[1], tel.trunk_tilt, tel.feet_in_contact as usize)
     }
 
+    pub fn legs_penetration(&self) -> f32 {
+        crate::robot::legs_penetration(&self.w, &self.r)
+    }
+
+    pub fn legs_overlap(&self) -> bool {
+        crate::robot::legs_overlap(&self.w, &self.r)
+    }
+
     pub fn standing(&self) -> bool {
         let tel = telemetry(&self.w, &self.r, None);
         tel.trunk_tilt < 0.35 && tel.com[1] > 1.6 && tel.feet_in_contact >= 1

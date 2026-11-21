@@ -122,9 +122,12 @@ pub fn trunk_angles(q: &Rotation, inv_heading: &Rotation) -> (f32, f32) {
 }
 
 pub fn foot_in_contact(w: &PhysicsWorld, leg: &Leg) -> bool {
-    w.narrow_phase
-        .contact_pairs_with(leg.foot_collider)
-        .any(|p| p.has_any_active_contact())
+    // Ground contact only (a foot brushing the other leg doesn't count).
+    w.narrow_phase.contact_pairs_with(leg.foot_collider).any(|p| {
+        let other = if p.collider1 == leg.foot_collider { p.collider2 } else { p.collider1 };
+        p.has_any_active_contact()
+            && w.colliders.get(other).map(|c| c.collision_groups().memberships.contains(Group::GROUP_1)).unwrap_or(false)
+    })
 }
 
 pub fn centre_of_mass(w: &PhysicsWorld, r: &Robot) -> (Vector, Vector) {

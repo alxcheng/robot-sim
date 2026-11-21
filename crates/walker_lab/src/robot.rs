@@ -127,6 +127,59 @@ impl RobotSpec {
     }
 }
 
+/// Leg links that can touch the other leg (thigh down to foot).
+pub fn leg_side(name: &str) -> Option<usize> {
+    let is_leg = ["_thigh", "_shin", "_meta", "_foot", "_ankle_ball"].iter().any(|s| name.ends_with(s));
+    if !is_leg {
+        None
+    } else if name.starts_with("L_") {
+        Some(0)
+    } else if name.starts_with("R_") {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Deepest overlap (m) between any left-leg and right-leg part; 0 if they don't touch.
+pub fn legs_penetration(w: &PhysicsWorld, r: &Robot) -> f32 {
+    let mut side: [Vec<ColliderHandle>; 2] = [Vec::new(), Vec::new()];
+    for l in &r.links {
+        if let Some(k) = leg_side(&l.name) {
+            side[k].extend(w.bodies[l.body].colliders().iter().copied());
+        }
+    }
+    let mut deepest = 0.0f32;
+    for a in &side[0] {
+        for b in &side[1] {
+            let (ca, cb) = (&w.colliders[*a], &w.colliders[*b]);
+            if let Ok(Some(c)) = rapier3d::parry::query::contact(ca.position(), ca.shape(), cb.position(), cb.shape(), 0.0) {
+                deepest = deepest.max(-c.dist);
+            }
+        }
+    }
+    deepest
+}
+
+/// True if any part of the left leg overlaps any part of the right leg (geometric check).
+pub fn legs_overlap(w: &PhysicsWorld, r: &Robot) -> bool {
+    let mut side: [Vec<ColliderHandle>; 2] = [Vec::new(), Vec::new()];
+    for l in &r.links {
+        if let Some(k) = leg_side(&l.name) {
+            side[k].extend(w.bodies[l.body].colliders().iter().copied());
+        }
+    }
+    for a in &side[0] {
+        for b in &side[1] {
+            let (ca, cb) = (&w.colliders[*a], &w.colliders[*b]);
+            if rapier3d::parry::query::intersection_test(ca.position(), ca.shape(), cb.position(), cb.shape()).map(|x| x.intersecting).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn robot_groups() -> InteractionGroups {
     InteractionGroups::new(Group::GROUP_2, Group::GROUP_1, InteractionTestMode::And)
 }
@@ -268,7 +321,14 @@ pub(crate) fn add_body(
     let mut cols = Vec::new();
     let mut shapes = Vec::new();
     for p in parts {
-        let groups = if collide { robot_groups() } else { no_contact_groups() };
+        // Legs are solid to each other (each leg collides with the ground and the other leg);
+        // other robot parts collide with the ground only.
+        let groups = match (collide, leg_side(&name)) {
+            (false, _) => no_contact_groups(),
+            (true, Some(0)) => InteractionGroups::new(Group::GROUP_2 | Group::GROUP_3, Group::GROUP_1 | Group::GROUP_4, InteractionTestMode::And),
+            (true, Some(_)) => InteractionGroups::new(Group::GROUP_2 | Group::GROUP_4, Group::GROUP_1 | Group::GROUP_3, InteractionTestMode::And),
+            (true, None) => robot_groups(),
+        };
         let (kind, taper) = shape_style(p.tag);
         let base = if kind == "ball" {
             ColliderBuilder::ball(p.half[0])

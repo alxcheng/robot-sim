@@ -966,6 +966,46 @@ fn thrust_script() -> (Vec<(f32, controller::Command)>, Vec<(f32, String)>) {
 
 /// Allocation residuals at the standing pose for each thrust direction.
 /// Run each thrust test and print how it ends: fall time and the pose just before.
+/// Fraction of ticks where the legs pass through each other, over the thrust demo and a run.
+fn leg_clip(build: &str, policy_path: &str) {
+    let txt = fs::read_to_string(policy_path).expect("policy");
+    let mut net = match serde_json::from_str::<ppo::GaussPolicy>(&txt) {
+        Ok(p) => p.net,
+        Err(_) => serde_json::from_str::<policy::Mlp>(&txt).unwrap(),
+    };
+    net.expand_inputs(policy::OBS_DIM);
+    let gait = load_run_gait(build, 0.0);
+    let cfg = ppo::RewardCfg { stride_target: 1.8, thrust_k: 1.0, vmax: 7.0, speed_mode: true, omni: true, knock_dv: 3.0 };
+    let mut runs: Vec<(&str, Vec<(f32, controller::Command)>, f32)> = vec![("thrust demo", thrust_script().0, 13.0)];
+    runs.push(("run 1.5→6", vec![cmd(0.0, 1.5, 0.0), cmd(1.0, 3.75, 0.0), cmd(2.5, 6.0, 0.0)], 10.0));
+    runs.push(("jog back", vec![cmd(0.0, 1.0, 0.0), cmd_l(1.5, -1.5, 0.0, 0.0)], 8.0));
+    runs.push(("sidestep L", vec![cmd(0.0, 1.0, 0.0), cmd_l(1.5, 0.0, 1.0, 0.0)], 8.0));
+    for (name, cmds, dur) in runs {
+        let mut sc = scenario("run_mid", 0.0);
+        sc.spec = build_spec(build);
+        sc.duration = dur;
+        sc.commands = cmds;
+        let mut env = ppo::Env::with(sc.spec, gait, sc.clone(), ppo::EpMode::Thrust, 0.0);
+        let (mut n, mut hit, mut fell, mut deep) = (0, 0, false, 0.0f32);
+        while env.t() < dur {
+            let o = env.obs();
+            let a = net.forward_norm(&o);
+            let (_, term, _) = env.step(&net, &a, cfg);
+            n += 1;
+            let d = env.legs_penetration();
+            deep = deep.max(d);
+            if d > 0.03 {
+                hit += 1;
+            }
+            if term {
+                fell = true;
+                break;
+            }
+        }
+        println!("{build} {name:12} legs visibly overlapping (>3 cm) {:5.1}% of ticks, deepest {:.0} cm{}", 100.0 * hit as f32 / n as f32, deep * 100.0, if fell { " (fell)" } else { "" });
+    }
+}
+
 fn thrust_diag(build: &str, policy_path: &str) {
     let txt = fs::read_to_string(policy_path).expect("policy");
     let mut net = match serde_json::from_str::<ppo::GaussPolicy>(&txt) {
@@ -1090,6 +1130,7 @@ fn main() {
         Some("diag") => diag(),
         Some("runreport") => run_report(),
         Some("evaldistill") => eval_distill(&a(2).unwrap(), a(3).map(|s| s.parse().unwrap()).unwrap_or(0.0)),
+        Some("legclip") => leg_clip(&a(2).unwrap(), &a(3).unwrap()),
         Some("thrustdiag") => thrust_diag(&a(2).unwrap(), &a(3).unwrap()),
         Some("thrustcheck") => thrust_check(&a(2).unwrap()),
         Some("thrustdemo") => thrust_demo(&a(2).unwrap(), &a(3).unwrap(), &a(4).unwrap()),
