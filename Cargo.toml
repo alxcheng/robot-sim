@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/walker_lab"]
+members = ["crates/walker_lab", "crates/armor_lab"]
 
 [profile.release]
 debug = false

@@ -1,0 +1,72 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Armor Lab</title>
+<style>
+  body { margin: 0; background: #11151b; overflow: hidden; font-family: ui-monospace, Menlo, monospace; }
+  #hud { position: absolute; left: 12px; top: 10px; color: #c9d3de; font-size: 13px; line-height: 1.5; }
+  #hud b { color: #f0a63a; }
+  #title { position: absolute; right: 14px; top: 10px; color: #f0a63a; font-size: 18px; letter-spacing: 1px; }
+</style></head>
+<body><div id="hud"></div><div id="title"></div>
+<script>
+let scene, cam, ren, plateGroup, ball, rest;
+function init(w, h) {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x11151b);
+  cam = new THREE.PerspectiveCamera(38, w / h, 0.01, 100);
+  cam.position.set(1.15, 0.75, 1.25);
+  cam.lookAt(0, -0.05, 0);
+  ren = new THREE.WebGLRenderer({ antialias: true });
+  ren.setSize(w, h);
+  document.body.appendChild(ren.domElement);
+  scene.add(new THREE.HemisphereLight(0xdfe8f2, 0x1a1f26, 0.75));
+  const d = new THREE.DirectionalLight(0xffffff, 0.9); d.position.set(2, 3, 1.5); scene.add(d);
+  // Bolted frame around the plate.
+  const frameMat = new THREE.MeshStandardMaterial({ color: 0x2c333d, metalness: 0.3, roughness: 0.7 });
+  for (const [sx, sz, px, pz] of [[1.32, 0.08, 0, 0.44], [1.32, 0.08, 0, -0.44], [0.08, 0.96, 0.64, 0], [0.08, 0.96, -0.64, 0]]) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(sx, 0.1, sz), frameMat); m.position.set(px, -0.02, pz); scene.add(m);
+  }
+  plateGroup = new THREE.Group(); scene.add(plateGroup);
+  ball = new THREE.Mesh(new THREE.SphereGeometry(REC.ball_r, 32, 16), new THREE.MeshStandardMaterial({ color: 0x8a9099, metalness: 0.8, roughness: 0.3 }));
+  scene.add(ball);
+  const f0 = REC.frames[0].meshes[0].p; rest = f0.slice();
+  document.getElementById('title').textContent = REC.label || '';
+}
+function color(dy) {
+  // 0 → steel grey, 3 cm → amber, 10+ cm → red.
+  const t = Math.min(1, Math.max(0, dy / 0.10));
+  const a = [0.55, 0.58, 0.62], b = [0.94, 0.65, 0.23], c = [0.85, 0.2, 0.15];
+  const k = t < 0.3 ? t / 0.3 : (t - 0.3) / 0.7, u = t < 0.3 ? a : b, v = t < 0.3 ? b : c;
+  return [u[0] + (v[0] - u[0]) * k, u[1] + (v[1] - u[1]) * k, u[2] + (v[2] - u[2]) * k];
+}
+let peak = 0;
+function show(i) {
+  const f = REC.frames[i];
+  while (plateGroup.children.length) { const c = plateGroup.children.pop(); c.geometry.dispose(); }
+  let maxDy = 0;
+  f.meshes.forEach((m, mi) => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(m.p, 3));
+    g.setIndex(m.t);
+    const cols = new Float32Array(m.p.length);
+    for (let k = 0; k < m.p.length; k += 3) {
+      const same = mi === 0 && m.p.length === rest.length;
+      // After a tear the particle list changes: fall back to the drop below the plate's top face.
+      const dy = same ? rest[k + 1] - m.p[k + 1] : Math.max(0, 0.03 - m.p[k + 1]) * (m.p[k + 1] > -0.025 ? 1 : 0);
+      if (same && Math.abs(rest[k]) < 0.3 && Math.abs(rest[k + 2]) < 0.3) maxDy = Math.max(maxDy, dy);
+      const c = color(dy); cols[k] = c[0]; cols[k + 1] = c[1]; cols[k + 2] = c[2];
+    }
+    g.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+    g.computeVertexNormals();
+    plateGroup.add(new THREE.Mesh(g, new THREE.MeshStandardMaterial({ vertexColors: true, metalness: 0.55, roughness: 0.45, side: THREE.DoubleSide, flatShading: true })));
+  });
+  ball.position.set(f.ball[0], f.ball[1], f.ball[2]);
+  ball.visible = f.ball[1] < 5;
+  peak = Math.max(peak, maxDy);
+  const e = 0.5 * REC.ball_m * REC.speed * REC.speed / 1000;
+  document.getElementById('hud').innerHTML =
+    `RAPIER FEM ARMOR PLATE · 1.2 × 0.8 × 0.06 m · 450 kg · rim bolted<br>` +
+    `impactor 80 kg at <b>${REC.speed} m/s</b> (${e.toFixed(0)} kJ) · slow motion ×2<br>` +
+    (f.meshes.length > 1 ? `t ${f.t.toFixed(2)} s · <b>TORN</b> into ${f.meshes.length} pieces · final dent ${(REC.permanent * 100).toFixed(1)} cm` : `t ${f.t.toFixed(2)} s · dent now <b>${(maxDy * 100).toFixed(1)} cm</b> · peak ${(peak * 100).toFixed(1)} cm`);
+  ren.render(scene, cam);
+}
+</script></body></html>
