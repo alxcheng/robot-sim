@@ -312,6 +312,17 @@ fn wall_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::Va
     (rec, summary)
 }
 
+/// A breakable connection: the joint to `child`, and every link beyond it.
+struct Conn {
+    name: String,
+    child: RigidBodyHandle,
+    distal: Vec<RigidBodyHandle>,
+    strength: f32,
+    load: f32,
+    peak: f32,
+    broken_at: Option<f32>,
+}
+
 /// One metal shell: an FEM body standing in for a robot part, bolted to a mount on its link.
 struct Shell {
     handle: SoftBodyHandle,
@@ -507,10 +518,71 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
     let wall_z = front + if pilot.is_some() { env_or("RUNUP", 12.0) } else { 2.5 };
     let wall_half = Vector::new(4.0, 3.5, 0.4);
     let wall_c = Vector::new(0.0, wall_half.y, wall_z + wall_half.z);
-    w.insert(
-        RigidBodyBuilder::fixed().translation(wall_c),
-        ColliderBuilder::cuboid(wall_half.x, wall_half.y, wall_half.z).friction(0.8).collision_groups(robot::world_groups()),
-    );
+    let pull = std::env::var("PULL").ok();
+    if pull.is_none() {
+        w.insert(
+            RigidBodyBuilder::fixed().translation(wall_c),
+            ColliderBuilder::cuboid(wall_half.x, wall_half.y, wall_half.z).friction(0.8).collision_groups(robot::world_groups()),
+        );
+    } else {
+        // Pull-apart rig: no gravity (a test frame holds nothing; the cables do all the work).
+        w.gravity = Vector::ZERO;
+    }
+    // Breakable connections: (name, child link, links beyond it, strength in N).
+    let body_of = |n: &str| r.links.iter().find(|l| l.name == n).map(|l| l.body);
+    let mut conns: Vec<Conn> = Vec::new();
+    let jitter = |k: usize| 1.0 + 0.08 * (((k * 7919 + 13) % 17) as f32 / 8.0 - 1.0);
+    let mut k = 0;
+    let mut add = |conns: &mut Vec<Conn>, name: String, child: &str, distal: &[String], strength: f32| {
+        if let Some(c) = body_of(child) {
+            let d: Vec<RigidBodyHandle> = distal.iter().filter_map(|n| body_of(n)).collect();
+            k += 1;
+            conns.push(Conn { name, child: c, distal: d, strength: strength * jitter(k), load: 0.0, peak: 0.0, broken_at: None });
+        }
+    };
+    let arm = |n: &str| vec![format!("{n}_shoulder_ball"), format!("{n}_shoulder_pitch"), format!("{n}_upper_arm"), format!("{n}_forearm")];
+    let leg = |n: &str| vec![format!("{n}_hip_ball"), format!("{n}_hip_roll"), format!("{n}_thigh"), format!("{n}_shin"), format!("{n}_meta"), format!("{n}_ankle_ball"), format!("{n}_foot")];
+    let mut waist_d = vec!["upper_body".to_string()];
+    waist_d.extend(arm("L"));
+    waist_d.extend(arm("R"));
+    add(&mut conns, "waist".into(), "upper_body", &waist_d, env_or("S_WAIST", 1.4e6));
+    for n in ["L", "R"] {
+        let a = arm(n);
+        let l = leg(n);
+        add(&mut conns, format!("{n} shoulder"), &a[0], &a, env_or("S_SHOULDER", 0.7e6));
+        add(&mut conns, format!("{n} elbow"), &a[3], &a[3..], env_or("S_ELBOW", 0.5e6));
+        add(&mut conns, format!("{n} hip"), &l[0], &l, env_or("S_HIP", 1.0e6));
+        add(&mut conns, format!("{n} knee"), &l[3], &l[3..], env_or("S_KNEE", 0.8e6));
+        add(&mut conns, format!("{n} hock"), &l[4], &l[4..], env_or("S_HOCK", 0.65e6));
+        add(&mut conns, format!("{n} ankle"), &l[5], &l[5..], env_or("S_ANKLE", 0.55e6));
+    }
+    // Cables: (link, pull direction). Tension ramps 0 → PULL_MAX over PULL_T seconds.
+    let mut cables: Vec<(String, RigidBodyHandle, Vector, bool)> = Vec::new();
+    let mut cable = |name: &str, dir: Vector| {
+        if let Some(b) = body_of(name) {
+            cables.push((name.to_string(), b, dir.normalize(), false));
+        }
+    };
+    match pull.as_deref() {
+        Some("arms") => {
+            cable("L_forearm", Vector::new(1.0, 0.0, 0.0));
+            cable("R_forearm", Vector::new(-1.0, 0.0, 0.0));
+        }
+        Some("legs") => {
+            cable("L_meta", Vector::new(1.0, -0.3, 0.0));
+            cable("R_meta", Vector::new(-1.0, -0.3, 0.0));
+        }
+        Some("quarter") => {
+            cable("L_forearm", Vector::new(1.0, 0.6, 0.0));
+            cable("R_forearm", Vector::new(-1.0, 0.6, 0.0));
+            cable("L_meta", Vector::new(1.0, -0.6, 0.0));
+            cable("R_meta", Vector::new(-1.0, -0.6, 0.0));
+        }
+        _ => {}
+    }
+    let (pull_max, pull_t) = (env_or("PULL_MAX", 2.0e6), env_or("PULL_T", 4.0));
+    let mut link_v: std::collections::HashMap<RigidBodyHandle, Vector> = r.links.iter().map(|l| (l.body, Vector::ZERO)).collect();
+    let mut events: Vec<String> = Vec::new();
     let total_mass: f32 = r.links.iter().map(|l| w.bodies[l.body].mass()).sum::<f32>()
         + shells.iter().map(|s| w.soft_bodies[s.handle].mass() + if s.driven.is_empty() { w.bodies[s.mount].mass() } else { 0.0 }).sum::<f32>();
     let n_particles: usize = shells.iter().map(|s| w.soft_bodies[s.handle].num_particles()).sum();
@@ -538,6 +610,21 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
         }
         for sh in &shells {
             w.soft_bodies[sh.handle].reset_forces(true);
+        }
+        let tension = if pull.is_some() { pull_max * (t / pull_t).min(1.0) } else { 0.0 };
+        let mut cable_rec: Vec<[f32; 7]> = Vec::new();
+        for (_, b, dir, released) in &cables {
+            if *released {
+                continue;
+            }
+            let rb = &mut w.bodies[*b];
+            rb.add_force(*dir * tension, true);
+            let p = rb.translation();
+            let q = p + *dir * 4.0;
+            cable_rec.push([p.x, p.y, p.z, q.x, q.y, q.z, tension / 1000.0]);
+        }
+        if pull.is_some() {
+            launch = Some((1e9, 0.0));
         }
         let tz = w.bodies[r.trunk].translation().z;
         if launch.is_none() && pilot.is_some() && tz > wall_z - launch_at {
@@ -599,6 +686,63 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
             break;
         }
         tracker.update([walker_lab::controller::foot_in_contact(&w, &r.legs[0]), walker_lab::controller::foot_in_contact(&w, &r.legs[1])], DT);
+        if pull.is_some() {
+            // Load on each connection = what it must supply to the links beyond it:
+            // Σ m·a − Σ external force (cables; no gravity, no contacts in the rig).
+            let acc: std::collections::HashMap<RigidBodyHandle, Vector> = r.links.iter().map(|l| {
+                let v = w.bodies[l.body].linvel();
+                (l.body, (v - link_v[&l.body]) / DT)
+            }).collect();
+            for l in &r.links {
+                link_v.insert(l.body, w.bodies[l.body].linvel());
+            }
+            let mut to_break = Vec::new();
+            for (ci, c) in conns.iter_mut().enumerate() {
+                if c.broken_at.is_some() {
+                    continue;
+                }
+                let mut f = Vector::ZERO;
+                for b in &c.distal {
+                    f += w.bodies[*b].mass() * acc[b];
+                    for (_, cb, dir, released) in &cables {
+                        if cb == b && !*released {
+                            f -= *dir * tension;
+                        }
+                    }
+                }
+                // Smoothed over ~3 steps so one solver spike doesn't snap a joint.
+                c.load = 0.6 * c.load + 0.4 * f.length();
+                if s > 3 {
+                    c.peak = c.peak.max(c.load);
+                }
+                if s > 3 && c.load > c.strength {
+                    to_break.push(ci);
+                }
+            }
+            for ci in to_break {
+                let child = conns[ci].child;
+                // A joint already gone (an inner connection broke first) can't break again.
+                if conns.iter().any(|c| c.broken_at.is_some() && c.distal.contains(&child) && c.child != child) {
+                    continue;
+                }
+                let handle = w.multibody_joints().find(|(_, _, _, link)| link.rigid_body_handle() == child).map(|(h, ..)| h);
+                if let Some(h) = handle {
+                    w.remove_multibody_joint(h);
+                    conns[ci].broken_at = Some(t);
+                    events.push(format!("{:.2}s {} snapped at {:.0} kN (strength {:.0} kN)", t, conns[ci].name, conns[ci].load / 1000.0, conns[ci].strength / 1000.0));
+                    if std::env::var("DEBUG").is_ok() {
+                        eprintln!("{}", events.last().unwrap());
+                    }
+                    // Cables on the piece that came off let go.
+                    let distal = conns[ci].distal.clone();
+                    for cab in cables.iter_mut() {
+                        if distal.contains(&cab.1) {
+                            cab.3 = true;
+                        }
+                    }
+                }
+            }
+        }
         // Stability guardrail: clamp runaway velocities (the spec's post-step safety pass).
         let mut bad = false;
         for b in &all_bodies {
@@ -758,7 +902,8 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
             eprintln!("t {:.2} trunk z {:.2} vz {:.1} pieces {} dent {:.2}", t, w.bodies[r.trunk].translation().z, v, w.soft_bodies.len(), dent_now);
         }
         frames.push(serde_json::json!({"t": t, "b": b, "speed": v, "cmd_speed": speed, "heading": 0.0, "cmd_heading": 0.0,
-            "label": if launching { "DASH" } else { "" }, "feet": 0, "toe": [0.0, 0.0], "contact": [false, false], "soft": meshes, "dent": dent_now, "thr": thr_rec}));
+            "label": if launching { "DASH" } else { "" }, "feet": 0, "toe": [0.0, 0.0], "contact": [false, false], "soft": meshes, "dent": dent_now, "thr": thr_rec,
+            "cables": cable_rec, "events": events.clone()}));
     }
     if std::env::var("DEBUG").is_ok() {
         for sh in &shells {
@@ -812,8 +957,10 @@ fn metal_crash(build: &str, speed: f32, mat: SoftBodyMaterial) -> (serde_json::V
     let rec = serde_json::json!({
         "scenario": format!("all-metal {} robot smashed into a wall · {speed} m/s", match build { "GL" => "light", "GM" => "medium", _ => "heavy" }),
         "assist": 0.0, "dt": DT, "links": r.links, "platform": null, "pushes": [], "frames": frames,
-        "wall": [wall_c.x, wall_c.y, wall_c.z, wall_half.x, wall_half.y, wall_half.z],
+        "wall": if pull.is_some() { serde_json::Value::Null } else { serde_json::json!([wall_c.x, wall_c.y, wall_c.z, wall_half.x, wall_half.y, wall_half.z]) },
         "hide": hidden, "shells": shell_info, "summary": summary,
+        "pull": pull.clone(), "breaks": events.clone(),
+        "loads": conns.iter().map(|c| serde_json::json!({"name": c.name, "peak_kN": c.peak / 1000.0, "strength_kN": c.strength / 1000.0, "broken_at": c.broken_at})).collect::<Vec<_>>(),
     });
     (rec, summary)
 }

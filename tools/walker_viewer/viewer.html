@@ -250,7 +250,7 @@ function init(width, height) {
 }
 
 function show(i) {
-  if (window.CAM && window.CAM !== 'crash') { document.getElementById('hud').style.display = 'none'; document.getElementById('legend').style.display = 'none'; document.getElementById('label').style.display = 'none'; }
+  if (window.CAM && window.CAM !== 'crash' && window.CAM !== 'rig') { document.getElementById('hud').style.display = 'none'; document.getElementById('legend').style.display = 'none'; document.getElementById('label').style.display = 'none'; }
   const f = REC.frames[i];
   f.b.forEach((p, k) => {
     meshes[k].position.set(p[0], p[1], p[2]);
@@ -266,6 +266,7 @@ function show(i) {
   }
   const off = window.CAM === 'front' ? new THREE.Vector3(0.0, 0.5, 9.5) : window.CAM === 'side' ? new THREE.Vector3(9.5, 0.4, 0.0)
     : window.CAM === 'back' ? new THREE.Vector3(-5.0, 1.6, -7.5)
+    : window.CAM === 'rig' ? new THREE.Vector3(0.5, 0.6, 9.0)
     : window.CAM === 'crash' ? (REC.hide ? new THREE.Vector3(6.0, 2.6, -4.2) : new THREE.Vector3(3.6, 0.9, -0.9)) : new THREE.Vector3(7.0, 2.4, 5.5);
   const desired = target.clone().add(off);
   if (!camPos) { camPos = desired.clone(); camTarget = target.clone(); }
@@ -293,6 +294,19 @@ function show(i) {
     mesh.castShadow = true; softGroup.add(mesh);
   }
   if (f.dent !== undefined) { window.peakDent = Math.max(window.peakDent || 0, f.dent); }
+
+  // Pull-apart rig: cables from the grip point outward, thicker/brighter with tension.
+  if (window.cableObjs) window.cableObjs.forEach(o => scene.remove(o));
+  window.cableObjs = [];
+  for (const c of (f.cables || [])) {
+    const a = new THREE.Vector3(c[0], c[1], c[2]), b = new THREE.Vector3(c[3], c[4], c[5]);
+    const len = a.distanceTo(b), mid = a.clone().add(b).multiplyScalar(0.5);
+    const rope = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, len, 8), new THREE.MeshBasicMaterial({ color: 0xe3a42c }));
+    rope.position.copy(mid); rope.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), b.clone().sub(a).normalize());
+    const winch = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.35, 0.35), new THREE.MeshStandardMaterial({ color: 0x55697d }));
+    winch.position.copy(b);
+    scene.add(rope); scene.add(winch); window.cableObjs.push(rope, winch);
+  }
 
   // Thruster flames: exhaust points opposite the force; length grows with force (kN).
   if (window.flames) window.flames.forEach(a => scene.remove(a));
@@ -325,6 +339,12 @@ function show(i) {
     `heading ${(f.heading * 57.3).toFixed(0)}° / cmd ${(f.cmd_heading * 57.3).toFixed(0)}°<br>` +
     `upright assist ${assist}`;
   if (f.dent !== undefined) {
+    if (REC.pull) {
+      const tn = (f.cables && f.cables.length) ? f.cables[0][6] : 0;
+      document.getElementById('hud').innerHTML = `<div class="title">${REC.scenario.toUpperCase()}</div>t ${f.t.toFixed(2)} s · cable tension <b>${tn.toFixed(0)} kN</b> each` +
+        `<br>joints: waist 1400 · hip 1000 · knee 800 · shoulder 700 · hock 650 · ankle 550 · elbow 500 kN (±8%)` +
+        (f.events || []).map(e => `<br><b>✕ ${e}</b>`).join('');
+    } else
     document.getElementById('hud').innerHTML += REC.hide ? `<br>every part FEM metal · metal pieces <b>${f.soft.length}</b>` + `<br>slow motion ×${(REC.slowmo || 1)}` : `<br>FEM chest plate: dent <b>${(f.dent * 100).toFixed(1)} cm</b> · peak ${(window.peakDent * 100).toFixed(1)} cm · pieces ${f.soft.length}` +
       `<br>slow motion ×${(REC.slowmo || 1)}`;
   }
